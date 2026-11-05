@@ -300,6 +300,20 @@ Project maintenance tasks:
 
 **Progress**: See [OUTSTANDING.md](OUTSTANDING.md) for detailed tracking.
 
+
+## Firmware Analysis
+
+This exploit has been verified against the ASUS RT-N66U Merlin firmware source code:
+
+| Source File | $Id | Date |
+|-------------|-----|------|
+| `ap_eap_sm.c` | 279189 | 2011-08-23 |
+| `ap_eap_sm.h` | 268017 | 2011-06-21 |
+| `eapd.c` | 241391 | 2011-02-18 |
+
+**Verified struct offsets** calculated from source with proper ARM 32-bit alignment.
+See [FIRMWARE_ANALYSIS.md](FIRMWARE_ANALYSIS.md) for complete analysis.
+
 ## References
 
 ### Primary Sources
@@ -357,9 +371,12 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## Authors
 
-- **WPSplinter Implementation** – [@DensenDeluxe](https://github.com/DensenDeluxe)
-- **Original Research** – [@qkaiser](https://github.com/qkaiser)
+- **WPSplinter Implementation** - DensenDeluxe
+- **Original Research** - Quentin Kaiser
 
 ---
 
 *For questions or issues, please open a GitHub issue or contact the maintainers.*
+
+
+
