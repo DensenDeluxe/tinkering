@@ -329,18 +329,6 @@ Project maintenance tasks:
 
 Use **ONLY** against devices you own or are explicitly authorized to test.
 
-### German Criminal Law (StGB)
-
-Active testing may implicate the following sections:
-
-| Section | Description |
-|---------|-------------|
-| § 202a | Data spying (Datenausspähung) |
-| § 202b | Data snatching (Abfangen von Daten) |
-| § 202c | Preparing data spying (Vorbereiten des Ausspähens) |
-| § 303a | Data manipulation (Datenveränderung) |
-| § 303b | Computer sabotage (Computersabotage) |
-
 ### Disclaimer
 
 This tool is provided "as is" without warranty. Use at your own risk. Memory corruption during exploitation may cause device crashes or require resets.
