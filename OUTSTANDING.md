@@ -275,6 +275,18 @@ Code quality, privacy, legal boundaries, and upstream integration.
 ### C.14 - Deduplicate `phase_fingerprint`
 
 **Priority**: Low  
+**Status**: **Completed** ?
+
+**Description**:  
+EAP-IDs are now properly incremented between EAPOL-Start, Identity, and WSC M1 probe.
+
+**Changes Made**:
+- Added `self.eap_id += 1` before Identity Response
+- Added `self.eap_id += 1` before WSC M1 probe
+- Reduced sleep times from 0.5s to 0.3s for faster fingerprinting
+- Added clarifying comments
+
+**Priority**: Low  
 **Status**: Pending
 
 **Description**:  
@@ -285,6 +297,19 @@ v5 sends the probe twice due to a leftover code path.
 ---
 
 ### C.15 - Sanitize Output PCAPs Before Sharing
+
+**Priority**: Medium  
+**Status**: **Completed** ?
+
+**Description**:  
+Added `sanitize_pcap()` method to pseudonymize sensitive data in captured packets.
+
+**Fields Sanitized**:
+- SSID ? `SANITIZED_<UUID>`
+- Serial numbers ? `SNXXXXXX`
+- UUIDs ? `00000000-0000-0000-0000-000000000000`
+
+**Usage**: Enabled by default in `close(sanitize=True)`, can be disabled with `close(sanitize=False)"
 
 **Priority**: Medium  
 **Status**: Pending
@@ -374,8 +399,8 @@ Reference all original sources in derived work.
 - [ ] B.13: RF reliability soak test
 
 ### C. Housekeeping
-- [ ] C.14: Deduplicate `phase_fingerprint`
-- [ ] C.15: Sanitize output PCAPs before sharing
+- [x] C.14: Deduplicate `phase_fingerprint` ?
+- [x] C.15: Sanitize output PCAPs before sharing ?
 - [x] C.16: Document legal boundaries ✅
 - [ ] C.17: Upstream contribution — Wifit3 PR
 - [x] C.18: Preserve original sources
