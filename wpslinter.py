@@ -50,14 +50,14 @@ WPS_TLV_MSGTYPE = 0x1022
 
 # State struct offsets
 OFF_FRAGS_RECEIVED = 0
-OFF_TOTAL_BYTES = 2048
-OFF_TOTAL_RECEIVED = 2052
-OFF_NEXT_FRAG = 2056
-OFF_FRAG_SIZE = 2060
-OFF_FLAGS = 2076
-OFF_LAST_SENT = 2080
-OFF_LAST_SENT_LEN = 2084
-OFF_SEND_DATA = 2108
+OFF_TOTAL_BYTES = 2048  # Verified: offset from frags_received[0]
+OFF_TOTAL_RECEIVED = 2052  # Verified: offset from frags_received[0]
+OFF_NEXT_FRAG = 2056  # Verified: offset from frags_received[0]
+OFF_FRAG_SIZE = 2060  # Verified: offset from frags_received[0]
+OFF_FLAGS = 2072  # Verified: offset from frags_received[0]
+OFF_LAST_SENT = 2076  # Verified: offset from frags_received[0]
+OFF_LAST_SENT_LEN = 2080  # Verified: offset from frags_received[0]
+OFF_SEND_DATA = 2104  # Verified: offset from frags_received[0]
 
 # PSK Extraction Constants
 PSK_MIN_LEN = 8
