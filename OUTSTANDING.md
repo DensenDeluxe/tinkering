@@ -46,7 +46,7 @@ Determine real offsets of all struct members including compiler padding.
 1. ✅ Examined `ap_eap_sm.h` in ASUS RT-N66U Merlin firmware
 2. ✅ Calculated offsets with proper ARM 32-bit alignment (calc_offsets.py)
 3. ✅ Verified total struct size: 4186 bytes
-4. ✅ Updated wpslinter.py with verified offsets
+4. ✅ Updated wpsplinter.py with verified offsets
 
 **Impact**: Offsets now verified and integrated into exploit.
 

