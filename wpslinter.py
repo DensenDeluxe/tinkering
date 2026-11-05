@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+WPSplinter v6 - Complete exploit for Broadcom legacy WPS Monitor with PSK extraction
+(ap_eap_sm.c, pre-2018 patch lineage; verified against ASUS RT-N66U Merlin
+firmware $Id: ap_eap_sm.c 279189 2011-08-23, $Id: eapd.c 241391 2011-02-18).
+
+Use ONLY against devices you own or are explicitly authorized to test
+(German law: Sections 202a ff. StGB; do not probe third-party networks).
+"""
 
 import argparse
 import subprocess

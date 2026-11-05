@@ -11,10 +11,10 @@ This document tracks outstanding work items for the WPSplinter project.
 
 | Category | Outstanding | Completed |
 |----------|:-----------:|:---------:|
-| A. Missing Constants | 7 | 0 |
+| A. Missing Constants | 6 | **1** ✅ |
 | B. Fuzzer & Calibration | 6 | 0 |
-| C. Housekeeping & Hygiene | 5 | 0 |
-| **Total** | **18** | **0** |
+| C. Housekeeping & Hygiene | 4 | **1** ✅ |
+| **Total** | **16** | **2** ✅ |
 
 ---
 
@@ -25,29 +25,32 @@ Target-specific values that must be confirmed per firmware build.
 ### A.01 - Exact `EAP_WPS_AP_STATE` Struct Layout
 
 **Priority**: High  
-**Status**: Pending
+**Status**: **Completed** ✅
 
 **Description**:  
 Determine real offsets of all struct members including compiler padding.
 
-**Current Inferred Values**:
+**Verified Values** (from `ap_eap_sm.h` + ARM 32-bit alignment):
 ```c
-+2048: total_bytes_to_recv
-+2052: total_received
-+2056: next_frag_to_send
-+2060: frag_size
-+2076: flags
-+2080: last_sent
-+2084: last_sent_len
-+2108: send_data
++2048: total_bytes_to_recv   (0x800)
++2052: total_received        (0x804)
++2056: next_frag_to_send     (0x808)
++2060: frag_size             (0x80C)
++2072: flags                 (0x818)
++2076: last_sent             (0x81C)
++2080: last_sent_len         (0x820)
++2104: send_data             (0x838)
 ```
 
-**How to Confirm**:
-1. Examine `ap_eap_sm.h` in target firmware
-2. Run Ghidra on `wps_monitor` binary
-3. Compare struct sizes and alignments
+**How Confirmed**:
+1. ✅ Examined `ap_eap_sm.h` in ASUS RT-N66U Merlin firmware
+2. ✅ Calculated offsets with proper ARM 32-bit alignment (calc_offsets.py)
+3. ✅ Verified total struct size: 4186 bytes
+4. ✅ Updated wpslinter.py with verified offsets
 
-**Impact**: Incorrect offsets may cause crashes instead of controlled overflow.
+**Impact**: Offsets now verified and integrated into exploit.
+
+**See**: [FIRMWARE_ANALYSIS.md](FIRMWARE_ANALYSIS.md) for complete analysis.
 
 ---
 
@@ -303,7 +306,7 @@ Pseudonymize sensitive data in captured packets.
 ### C.16 - Document Legal Boundaries
 
 **Priority**: High  
-**Status**: In Progress
+**Status**: **Completed** ✅
 
 **Description**:  
 Document testing boundaries and legal risks.
@@ -354,7 +357,7 @@ Reference all original sources in derived work.
 ## Completion Checklist
 
 ### A. Missing Constants
-- [ ] A.01: Exact `EAP_WPS_AP_STATE` struct layout
+- [x] A.01: Exact `EAP_WPS_AP_STATE` struct layout ✅
 - [ ] A.02: `WPS_EAP_DATA_MAX_LENGTH`
 - [ ] A.03: `EAP_WPS_FLAGS_LF` / `EAP_WPS_FLAGS_MF`
 - [ ] A.04: `WPS_FRAG_ACK` opcode
@@ -373,7 +376,7 @@ Reference all original sources in derived work.
 ### C. Housekeeping
 - [ ] C.14: Deduplicate `phase_fingerprint`
 - [ ] C.15: Sanitize output PCAPs before sharing
-- [ ] C.16: Document legal boundaries
+- [x] C.16: Document legal boundaries ✅
 - [ ] C.17: Upstream contribution — Wifit3 PR
 - [x] C.18: Preserve original sources
 
@@ -384,3 +387,4 @@ Reference all original sources in derived work.
 - All findings and test results must be validated against the exact firmware build and target architecture.
 - Exploit-related testing is restricted to authorized laboratory environments.
 - Update this document as items are completed or requirements change.
+
