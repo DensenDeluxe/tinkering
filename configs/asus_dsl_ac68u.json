@@ -1,0 +1,15 @@
+{
+  "manufacturer": "ASUS",
+  "model": "DSL-AC68U",
+  "version": "3.0.0.4.384_56087",
+  "architecture": "arm",
+  "broadcom": true,
+  "ralink": false,
+  "exploitable": true,
+  "constants": {},
+  "vulnerability_indicators": {},
+  "notes": [
+    "Broadcom WPS implementation detected - likely vulnerable"
+  ],
+  "exploit_method": "broadcom_heap_overflow"
+}

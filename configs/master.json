@@ -1,0 +1,67 @@
+{
+  "generated": "2026-11-05",
+  "total_firmwares": 4,
+  "exploitable_count": 4,
+  "configs": {
+    "asus_dsl_ac68u": {
+      "manufacturer": "ASUS",
+      "model": "DSL-AC68U",
+      "version": "3.0.0.4.384_56087",
+      "architecture": "arm",
+      "broadcom": true,
+      "ralink": false,
+      "exploitable": true,
+      "constants": {},
+      "vulnerability_indicators": {},
+      "notes": [
+        "Broadcom WPS implementation detected - likely vulnerable"
+      ],
+      "exploit_method": "broadcom_heap_overflow"
+    },
+    "d-link_dsl_2740b": {
+      "manufacturer": "D-Link",
+      "model": "DSL-2740B",
+      "version": "2.06",
+      "architecture": "arm",
+      "broadcom": true,
+      "ralink": false,
+      "exploitable": true,
+      "constants": {},
+      "vulnerability_indicators": {},
+      "notes": [
+        "Broadcom WPS implementation detected - likely vulnerable"
+      ],
+      "exploit_method": "broadcom_heap_overflow"
+    },
+    "tenda_d301": {
+      "manufacturer": "Tenda",
+      "model": "D301",
+      "version": "1.2.11.2",
+      "architecture": "unknown",
+      "broadcom": true,
+      "ralink": false,
+      "exploitable": true,
+      "constants": {},
+      "vulnerability_indicators": {},
+      "notes": [
+        "Broadcom WPS implementation detected - likely vulnerable"
+      ],
+      "exploit_method": "broadcom_heap_overflow"
+    },
+    "tp-link_archer_d5_v2": {
+      "manufacturer": "TP-Link",
+      "model": "Archer-D5-V2",
+      "version": "150731",
+      "architecture": "arm",
+      "broadcom": true,
+      "ralink": false,
+      "exploitable": true,
+      "constants": {},
+      "vulnerability_indicators": {},
+      "notes": [
+        "Broadcom WPS implementation detected - likely vulnerable"
+      ],
+      "exploit_method": "broadcom_heap_overflow"
+    }
+  }
+}

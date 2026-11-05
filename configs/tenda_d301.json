@@ -1,0 +1,15 @@
+{
+  "manufacturer": "Tenda",
+  "model": "D301",
+  "version": "1.2.11.2",
+  "architecture": "unknown",
+  "broadcom": true,
+  "ralink": false,
+  "exploitable": true,
+  "constants": {},
+  "vulnerability_indicators": {},
+  "notes": [
+    "Broadcom WPS implementation detected - likely vulnerable"
+  ],
+  "exploit_method": "broadcom_heap_overflow"
+}

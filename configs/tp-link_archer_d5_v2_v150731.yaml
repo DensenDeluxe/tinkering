@@ -1,0 +1,33 @@
+manufacturer: TP-Link
+model: Archer-D5-V2
+firmware: '150731'
+architecture: arm
+verified: true
+plt_addresses:
+  system: '0x00009920'
+  malloc: '0x00009a04'
+  BN_CTX_free: '0x00009a70'
+  snprintf: '0x00009ad0'
+  fprintf: '0x00009cf8'
+  sprintf: '0x00009d70'
+  free: '0x00009dd0'
+  DH_free: '0x00009e00'
+  printf: '0x00009e0c'
+  BN_free: '0x00009e48'
+  strcpy: '0x00009e78'
+  ap_eap_sm_apm2d_free: '0x000418b8'
+  wfa_free: '0x00046380'
+  wps_vndr_ext_obj_free: '0x00019c58'
+  ap_ssr_free_all_scb: '0x00040d4c'
+offsets:
+  frags_received: '0x0000'
+  total_bytes_to_recv: '0x0800'
+  total_received: '0x0804'
+  next_frag_to_send: '0x0808'
+  frag_size: '0x080C'
+  flags: '0x0818'
+  last_sent: '0x081C'
+  last_sent_len: '0x0820'
+  send_data: '0x0838'
+notes:
+- PLT extracted from wps_monitor

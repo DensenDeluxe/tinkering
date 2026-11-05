@@ -1,0 +1,29 @@
+manufacturer: ASUS
+model: DSL-AC68U
+firmware: 3.0.0.4.384_21128
+architecture: arm
+verified: true
+plt_addresses:
+  system: '0x00009a88'
+  malloc: '0x00009b6c'
+  BN_CTX_free: '0x00009bd8'
+  snprintf: '0x00009c44'
+  fprintf: '0x00009e84'
+  sprintf: '0x00009ef0'
+  free: '0x00009f5c'
+  DH_free: '0x00009f80'
+  printf: '0x00009f8c'
+  BN_free: '0x00009fbc'
+  strcpy: '0x00009fec'
+offsets:
+  frags_received: '0x0000'
+  total_bytes_to_recv: '0x0800'
+  total_received: '0x0804'
+  next_frag_to_send: '0x0808'
+  frag_size: '0x080C'
+  flags: '0x0818'
+  last_sent: '0x081C'
+  last_sent_len: '0x0820'
+  send_data: '0x0838'
+notes:
+- PLT extracted from wps_monitor

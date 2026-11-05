@@ -1,0 +1,15 @@
+{
+  "manufacturer": "TP-Link",
+  "model": "Archer-D5-V2",
+  "version": "150731",
+  "architecture": "arm",
+  "broadcom": true,
+  "ralink": false,
+  "exploitable": true,
+  "constants": {},
+  "vulnerability_indicators": {},
+  "notes": [
+    "Broadcom WPS implementation detected - likely vulnerable"
+  ],
+  "exploit_method": "broadcom_heap_overflow"
+}
