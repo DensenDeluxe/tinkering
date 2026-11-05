@@ -369,8 +369,8 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## Authors
 
-- **WPSplinter Implementation** - @DensenDeluxe
-- **Original Research** - @qkaiser
+- **WPSplinter Implementation** – [@DensenDeluxe](https://github.com/DensenDeluxe)
+- **Original Research** – [@qkaiser](https://github.com/qkaiser)
 
 ---
 
