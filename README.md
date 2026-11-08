@@ -1,9 +1,5 @@
 # WPSplinter - Broadcom WPS Monitor Exploit
 
-[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![CVE-2026-8412](https://img.shields.io/badge/CVE-2026--8412-red.svg)](https://nvd.nist.gov/vuln/detail/CVE-2026-8412)
-
 **WPSplinter** is a complete exploit for the Broadcom legacy WPS Monitor vulnerability (CVE-2026-8412), discovered and documented by [Quentin Kaiser](https://quentinkaiser.be/). This implementation is verified against the public ASUS RT-N66U Merlin firmware source code.
 
 ## Table of Contents
