@@ -361,14 +361,4 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 - ✅ Documentation improvements
 - ✅ Upstream integration with Wifit3
 
-## Authors
-
-- **WPSplinter Implementation** - DensenDeluxe
-- **Original Research** - Quentin Kaiser
-
----
-
-*For questions or issues, please open a GitHub issue or contact the maintainers.*
-
-
 
