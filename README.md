@@ -37,7 +37,6 @@ WPSplinter exploits a heap buffer overflow in Broadcom's WPS (Wi-Fi Protected Se
 
 | Property | Value |
 |----------|-------|
-| **CVE** | CVE-2026-8412 |
 | **Buffer** | `frags_received[2048]` |
 | **Overflow Size** | ~63KB (LF field = 0xFFFF) |
 | **Trigger** | WPS fragment reassembly |
