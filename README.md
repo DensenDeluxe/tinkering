@@ -323,9 +323,6 @@ See [FIRMWARE_ANALYSIS.md](FIRMWARE_ANALYSIS.md) for complete analysis.
    - `eapd.c` ($Id: eapd.c 241391 2011-02-18 03:35:48Z stakita $)
    - `ap_eap_sm.h` ($Id: ap_eap_sm.h 268017 2011-06-21 09:48:46Z kenlo $)
 
-3. **CVE Database**
-   - CVE-2026-8412: https://nvd.nist.gov/vuln/detail/CVE-2026-8412
-
 ### Related Research
 
 - WPS Protocol Specification (Wi-Fi Alliance)
@@ -351,7 +348,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 This implementation is based on research by Quentin Kaiser. When using or distributing this code, please attribute the original research:
 
 > Based on "One Parser, Two Bugs, Many Routers" by Quentin Kaiser (2026).  
-> CVE-2026-8412. https://github.com/qkaiser/broadcom-wps
+> https://github.com/qkaiser/broadcom-wps
 
 ## Contributing
 
