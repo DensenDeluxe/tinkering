@@ -89,7 +89,7 @@ typedef struct {
 ```bash
 # Clone repository
 git clone https://github.com/DensenDeluxe/tinkering
-cd wpsplinter
+cd tinkering
 
 # Install dependencies
 pip install scapy
