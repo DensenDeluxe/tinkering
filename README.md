@@ -1,6 +1,6 @@
 # WPSplinter - Broadcom WPS Monitor Exploit
 
-**WPSplinter** is a complete exploit for the Broadcom legacy WPS Monitor vulnerability, discovered and documented by [Quentin Kaiser](https://quentinkaiser.be/). This implementation is verified against the public ASUS RT-N66U Merlin firmware source code.
+**WPSplinter** is a not yet complete exploit for the Broadcom legacy WPS Monitor vulnerability, discovered and documented by [Quentin Kaiser](https://quentinkaiser.be/). This implementation is verified against the public ASUS RT-N66U Merlin firmware source code.
 
 ## Table of Contents
 
