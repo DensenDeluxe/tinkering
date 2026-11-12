@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-WPSplinter v7 - Broadcom WPS Monitor Exploit
-=============================================
-Exploit for CVE-2026-8412 (WPSplinter) - Heap buffer overflow in Broadcom's
-legacy WPS Monitor EAP fragment reassembly implementation.
-
-References:
-  - Quentin Kaiser, "One Parser, Two Bugs, Many Routers" (Hexacon 2026)
-  - https://quentinkaiser.be/security/2026/10/16/one-parser-two-bugs/
-  - https://github.com/qkaiser/broadcom-wps
-
-Affected platforms:
-  - eCos-based: BCM3380, BCM3383, BCM33834
-  - Linux-based: BCM3390, BCM63xx, BCM65xx, BCM68xx
-
-The vulnerability allows an unauthenticated nearby attacker to:
-  1. Leak memory (including WiFi PSK) via fragment reassembly
-  2. Execute arbitrary code as root via heap buffer overflow
-
-Requirements: Python 3.7+, scapy >= 2.4.5, monitor-mode capable interface
-"""
 
 import argparse
 import logging
